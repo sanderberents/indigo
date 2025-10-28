@@ -1,6 +1,87 @@
 # Changelog
 
 All notable changes to INDIGO framework will be documented in this file.
+# [2.0-346] - 21 Oct Tue 2025
+## Overall:
+- indigo_ccd_driver:
+	- fixed bad no stretching inmage
+	- add linked stretching
+	- fix binning (%B) placeholder in filenames
+
+- indigo_timer:
+	- add null check for DEVICE_CONTEXT in timer logic
+
+- indigo_io: better connection handling
+
+- indigo_stretch: fix indigo_debayer 8-bit scaling
+
+## Driver Fixes:
+- indigo_ccd_playerone:
+	- add workaround for WB remapming issue introdiced in sdk 3.9.0 (fixed in 3.9.1 but I: prefer to keepp it)
+	- update SDK to v. 3.9.1
+
+- indigo_aux_upb3:
+	- use correct outlet names for USB ports 7 and 8
+	- support new response for power outlet state
+
+- indigo_focuser_mypro2:
+	- fix focuser position overflow and remove sleep before reading the response
+
+- indigo_wheel_playerone:
+	- fix mutex unlock before updating wheel slot property
+
+- indigo_mount_lx200:
+	- AstroPhysics reply to :SC# handling fixed
+
+
+# [2.0-344] - 21 Sep Sun 2025
+## Overall:
+- indigo_ccd_driver:
+	- fixed unstretched preview
+	- add linkd preview stretching
+
+## Driver Fixes:
+- indigo_ccd_playerone:
+	- SDK 3.9.0 is severely broken - reverted to 3.8.1
+
+# [2.0-342] - 14 Sep Sun 2025
+## Overall:
+- indigo_align: implement nutation, some refactoring
+- HIDAPI upgraded to 0.16
+
+## Driver Fixes:
+- indigo_agent_mount:
+	- fix lx200 server shutdown
+
+- indigo_ccd_asi:
+	- update SDK to v.1.39
+	- reset frame to sensor width and height fixed
+
+- indigo_ccd_apogee:
+	- fix potential reset to full frame issue
+
+- indigo_ccd_fli:
+	- fix potential reset to full frame issue
+
+- indigo_ccd_svb:
+	- fix potential reset to full frame issue
+
+- indigo_ccd_playerone:
+	- fix potential reset to full frame issue
+	- update SDK to v. 3.9.0
+
+- indigo_ccd_sbig:
+	- skip shutter delay for secondary CCD if primary CCD exposure is in progress
+	- fix reset to full frame issue
+
+- indigo_mount_ioptron:
+	- PEC support added to protocol 3.0+ mounts
+	- meridian handling support added to 3.0+ mounts
+
+- indigo_ccd_touptek & OEM:
+	- update Touptek & oem lib, version: 59.29465.20250907
+
+
 # [2.0-340] - 17 Aug Sat 2025
 
 ## New Drivers:
