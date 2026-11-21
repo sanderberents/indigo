@@ -1,0 +1,1601 @@
+// Copyright (c) 2026 INDIGO initiative
+// All rights reserved.
+//
+// You may use this software under the terms of 'INDIGO Astronomy
+// open-source license' (see LICENSE.md).
+//
+// THIS SOFTWARE IS PROVIDED BY THE AUTHORS 'AS IS' AND ANY EXPRESS
+// OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+// WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+// DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+// DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE
+// GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+// WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+// NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+// SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+/** INDIGO Active optics agent
+ \file indigo_agent_ao.c
+
+ The agent owns an off-axis guide camera (OAG) behind the active optics. Its images are tracked at the rate of the
+ camera (CCD_STREAMING, a series of single exposures as a fallback) and the AO is moved to reduce the star displacement d (gain GAIN per frame, dead-band MIN_MOVE),
+ which makes a closed loop: the AO deflection a (in OAG pixels) is part of the star position the camera sees. The slow
+ part of the deflection is handed over to the mount, "bumped", so that the AO relaxes to its centre: the total mount
+ displacement T integrates a with a long time constant, and is realised either through the Guider Agent
+ (AGENT_GUIDER_TARGET_OFFSET, while the Guider Agent is guiding) or by slow, rare pulses to a guide port selected in
+ this agent. At most one of them moves the mount at any time.
+
+ Conventions: all vectors are star displacements in the pixels of the OAG frame. The RA axis is the direction in which
+ the star moves when the mount is pulsed west, positive Dec is the direction of a north pulse. An AO axis is positive
+ along the EAST and NORTH item (relative mode: steps, absolute mode: percent of full deflection).
+ */
+
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <assert.h>
+#include <pthread.h>
+#include <errno.h>
+#include <limits.h>
+#include <sys/types.h>
+
+#include <indigo/indigo_driver_xml.h>
+#include <indigo/indigo_filter.h>
+#include <indigo/indigo_raw_utils.h>
+
+#include "indigo_agent_ao.h"
+
+#define DRIVER_VERSION 0x03000001
+#define DRIVER_NAME "indigo_agent_ao"
+
+#define MAX_STARS 50
+#define FRAME_TIMEOUT 3.0
+#define STATS_PERIOD 0.5
+#define GUIDER_AGENT_PREFIX "Guider Agent"
+#define MAX_TARGET_ARCSEC 100.0
+
+#define DEVICE_PRIVATE_DATA ((ao_agent_private_data *)device->private_data)
+#define CLIENT_PRIVATE_DATA ((ao_agent_private_data *)FILTER_CLIENT_CONTEXT->device->private_data)
+
+// -------------------------------------------------------------------------------- settings
+
+typedef struct {
+	const char *name;
+	const char *label;
+	double min, max, step, value;
+} setting_definition;
+
+enum {
+	S_EXPOSURE,
+	S_RADIUS,
+	S_GAIN,
+	S_MIN_MOVE,
+	S_RANGE,
+	S_MAX_DEFLECTION,
+	S_MAX_STEP,
+	S_CAL_STEP,
+	S_CAL_SETTLE,
+	S_CAL_FRAMES,
+	S_EX_AMPLITUDE,
+	S_EX_INTERVAL,
+	S_EX_CYCLES,
+	S_LOST_FRAMES,
+	S_AO_TIMEOUT,
+	S_BUMP_TAU,
+	S_BUMP_GAIN,
+	S_BUMP_INTERVAL,
+	S_BUMP_THRESHOLD,
+	S_MIN_PULSE,
+	S_MAX_PULSE,
+	S_CAL_PULSE,
+	S_RA_X,
+	S_RA_Y,
+	S_DEC_X,
+	S_DEC_Y,
+	S_ANGLE,
+	S_SCALE_RA,
+	S_SCALE_DEC,
+	S_OAG_ANGLE,
+	S_SPEED_RA,
+	S_SPEED_DEC,
+	S_OAG_SOP,
+	S_OAG_COS_DEC,
+	S_COUNT
+};
+
+static const setting_definition settings_definitions[S_COUNT] = {
+	{ "EXPOSURE", "Exposure (s)", 0.001, 2, 0, 0.1 },
+	{ "SELECTION_RADIUS", "Selection radius (px)", 4, 64, 1, 10 },
+	{ "GAIN", "Loop gain", 0.05, 1, 0, 0.5 },
+	{ "MIN_MOVE", "Minimum move (px)", 0, 5, 0, 0.05 },
+	{ "RANGE", "AO range (steps or %)", 1, 1000, 0, 50 },
+	{ "MAX_DEFLECTION", "Maximum deflection (% of the range)", 1, 100, 0, 100 },
+	{ "MAX_STEP", "Maximum step per request", 1, 1000, 0, 50 },
+	{ "CALIBRATION_STEP", "AO calibration step", 1, 200, 0, 10 },
+	{ "CALIBRATION_SETTLE", "Settle time (s)", 0, 10, 0, 0.5 },
+	{ "CALIBRATION_FRAMES", "Frames averaged", 1, 100, 1, 5 },
+	{ "EXERCISE_AMPLITUDE", "Exercise amplitude (% of the maximum deflection)", 1, 100, 0, 50 },
+	{ "EXERCISE_INTERVAL", "Exercise interval (s)", 0.1, 60, 0, 2 },
+	{ "EXERCISE_CYCLES", "Exercise cycles (0 = until aborted)", 0, 1000, 1, 3 },
+	{ "LOST_FRAMES", "Lost star frames limit", 1, 1000, 1, 30 },
+	{ "AO_TIMEOUT", "AO timeout (s)", 0.5, 60, 0, 5 },
+	{ "BUMP_TIME_CONSTANT", "Bump time constant (s)", 1, 600, 0, 30 },
+	{ "BUMP_GAIN", "Bump gain", 0, 2, 0, 1 },
+	{ "BUMP_INTERVAL", "Direct bump interval (s)", 0.5, 600, 0, 5 },
+	{ "BUMP_THRESHOLD", "Direct bump threshold (px)", 0.05, 50, 0, 0.5 },
+	{ "MIN_PULSE", "Minimum pulse (s)", 0.001, 5, 0, 0.02 },
+	{ "MAX_PULSE", "Maximum pulse (s)", 0.01, 30, 0, 1 },
+	{ "BUMP_CALIBRATION_PULSE", "Mount calibration pulse (s)", 0.05, 30, 0, 1 },
+	{ "RA_X", "AO RA axis X (px/step)", -1000, 1000, 0, 0 },
+	{ "RA_Y", "AO RA axis Y (px/step)", -1000, 1000, 0, 0 },
+	{ "DEC_X", "AO Dec axis X (px/step)", -1000, 1000, 0, 0 },
+	{ "DEC_Y", "AO Dec axis Y (px/step)", -1000, 1000, 0, 0 },
+	{ "ANGLE", "AO RA axis angle (deg)", -360, 360, 0, 0 },
+	{ "SCALE_RA", "AO RA scale (px/step)", 0, 1000, 0, 0 },
+	{ "SCALE_DEC", "AO Dec scale (px/step)", 0, 1000, 0, 0 },
+	{ "OAG_ANGLE", "OAG angle on the sky (deg)", -360, 360, 0, 0 },
+	{ "SPEED_RA", "OAG RA speed at the equator (px/s)", 0, 1000, 0, 0 },
+	{ "SPEED_DEC", "OAG Dec speed (px/s, sign is the parity)", -1000, 1000, 0, 0 },
+	{ "OAG_SIDE_OF_PIER", "Side of pier at calibration", -1, 1, 1, 0 },
+	{ "OAG_COS_DEC", "cos(dec) at calibration", 0, 1, 0, 1 }
+};
+
+enum {
+	T_PHASE,
+	T_FRAME_RATE,
+	T_DRIFT_X,
+	T_DRIFT_Y,
+	T_RMSE_X,
+	T_RMSE_Y,
+	T_SNR,
+	T_POSITION_RA,
+	T_POSITION_DEC,
+	T_OFFSET_X,
+	T_OFFSET_Y,
+	T_BUMP_RA_S,
+	T_BUMP_DEC_S,
+	T_BACKEND,
+	T_SATURATED,
+	T_LOST,
+	T_COUNT
+};
+
+static const setting_definition stats_definitions[T_COUNT] = {
+	{ "PHASE", "Phase", -10, 100, 0, 0 },
+	{ "FRAME_RATE", "Frame rate (Hz)", 0, 10000, 0, 0 },
+	{ "DRIFT_X", "Residual X (px)", -10000, 10000, 0, 0 },
+	{ "DRIFT_Y", "Residual Y (px)", -10000, 10000, 0, 0 },
+	{ "RMSE_X", "RMSE X (px)", 0, 10000, 0, 0 },
+	{ "RMSE_Y", "RMSE Y (px)", 0, 10000, 0, 0 },
+	{ "SNR", "SNR", 0, 1000000, 0, 0 },
+	{ "POSITION_RA", "AO position RA", -10000, 10000, 0, 0 },
+	{ "POSITION_DEC", "AO position Dec", -10000, 10000, 0, 0 },
+	{ "OFFSET_X", "AO deflection X (px)", -10000, 10000, 0, 0 },
+	{ "OFFSET_Y", "AO deflection Y (px)", -10000, 10000, 0, 0 },
+	{ "BUMP_RA_S", "Mount bump RA (arcsec)", -100000, 100000, 0, 0 },
+	{ "BUMP_DEC_S", "Mount bump Dec (arcsec)", -100000, 100000, 0, 0 },
+	{ "BUMP_BACKEND", "Bump back-end", 0, 2, 0, 0 },
+	{ "SATURATED", "AO at its limit", 0, 1, 0, 0 },
+	{ "LOST_FRAMES", "Frames without star", 0, 1000000, 0, 0 }
+};
+
+// -------------------------------------------------------------------------------- private data
+
+typedef struct {
+	indigo_property *start_process_property;
+	indigo_property *abort_process_property;
+	indigo_property *mode_property;
+	indigo_property *bump_mode_property;
+	indigo_property *dec_mode_property;
+	indigo_property *settings_property;
+	indigo_property *stats_property;
+	pthread_mutex_t frame_mutex;
+	char *frame_data;
+	long frame_size;
+	long frame_capacity;
+	char frame_url[INDIGO_VALUE_SIZE];
+	volatile unsigned long frame_serial;
+	char *work_data;
+	long work_size;
+	long work_capacity;
+	bool frames_wanted;
+	bool streaming;
+	bool has_streaming;
+	volatile indigo_property_state exposure_state;
+	volatile indigo_property_state streaming_state;
+	int saved_upload_mode;
+	int saved_image_format;
+	volatile indigo_property_state ao_ra_state, ao_dec_state;
+	volatile unsigned ao_ra_serial, ao_dec_serial;
+	volatile indigo_property_state guide_ra_state, guide_dec_state;
+	volatile unsigned guide_ra_serial, guide_dec_serial;
+	double pos_ra, pos_dec;
+	double want_ra, want_dec;
+	bool saturated;
+	bool locked;
+	double star_x, star_y;
+	int lock_width, lock_height;
+	indigo_frame_digest reference;
+	indigo_star_detection stars[MAX_STARS];
+	int lost_frames;
+	double snr;
+	double rmse_x_sum, rmse_y_sum;
+	unsigned long rmse_count;
+	double stats_time;
+	int rate_frames;
+	double mount_dec;
+	int mount_sop;
+	volatile bool mount_slewing;
+	volatile int guider_phase;
+	volatile int guider_frame;
+	volatile double guider_dithering;
+	volatile indigo_property_state guider_start_state;
+	volatile indigo_property_state guider_dither_state;
+	volatile double guider_target_ra, guider_target_dec;
+	int backend;
+	double bump_x, bump_y;
+	double base_x, base_y;
+	double done_x, done_y;
+	double bump_time;
+	double bump_pulse_time;
+	double sent_ra, sent_dec;
+	double write_time;
+	int process;
+	pthread_mutex_t mutex;
+} ao_agent_private_data;
+
+#define AGENT_START_PROCESS_PROPERTY					(DEVICE_PRIVATE_DATA->start_process_property)
+#define AGENT_AO_CALIBRATION_ITEM							(AGENT_START_PROCESS_PROPERTY->items + 0)
+#define AGENT_AO_BUMP_CALIBRATION_ITEM				(AGENT_START_PROCESS_PROPERTY->items + 1)
+#define AGENT_AO_EXERCISE_ITEM								(AGENT_START_PROCESS_PROPERTY->items + 2)
+#define AGENT_AO_CENTER_ITEM									(AGENT_START_PROCESS_PROPERTY->items + 3)
+#define AGENT_AO_TRACKING_ITEM								(AGENT_START_PROCESS_PROPERTY->items + 4)
+#define AGENT_ABORT_PROCESS_PROPERTY					(DEVICE_PRIVATE_DATA->abort_process_property)
+#define AGENT_ABORT_PROCESS_ITEM							(AGENT_ABORT_PROCESS_PROPERTY->items + 0)
+#define AGENT_AO_MODE_PROPERTY								(DEVICE_PRIVATE_DATA->mode_property)
+#define AGENT_AO_MODE_RELATIVE_ITEM						(AGENT_AO_MODE_PROPERTY->items + 0)
+#define AGENT_AO_MODE_ABSOLUTE_ITEM						(AGENT_AO_MODE_PROPERTY->items + 1)
+#define AGENT_AO_BUMP_MODE_PROPERTY						(DEVICE_PRIVATE_DATA->bump_mode_property)
+#define AGENT_AO_BUMP_MODE_AUTO_ITEM					(AGENT_AO_BUMP_MODE_PROPERTY->items + 0)
+#define AGENT_AO_BUMP_MODE_GUIDER_AGENT_ITEM	(AGENT_AO_BUMP_MODE_PROPERTY->items + 1)
+#define AGENT_AO_BUMP_MODE_DIRECT_ITEM				(AGENT_AO_BUMP_MODE_PROPERTY->items + 2)
+#define AGENT_AO_BUMP_MODE_OFF_ITEM						(AGENT_AO_BUMP_MODE_PROPERTY->items + 3)
+#define AGENT_AO_DEC_MODE_PROPERTY						(DEVICE_PRIVATE_DATA->dec_mode_property)
+#define AGENT_AO_DEC_MODE_BOTH_ITEM						(AGENT_AO_DEC_MODE_PROPERTY->items + 0)
+#define AGENT_AO_DEC_MODE_NORTH_ITEM					(AGENT_AO_DEC_MODE_PROPERTY->items + 1)
+#define AGENT_AO_DEC_MODE_SOUTH_ITEM					(AGENT_AO_DEC_MODE_PROPERTY->items + 2)
+#define AGENT_AO_SETTINGS_PROPERTY						(DEVICE_PRIVATE_DATA->settings_property)
+#define AGENT_AO_STATS_PROPERTY								(DEVICE_PRIVATE_DATA->stats_property)
+#define SET(n)																(AGENT_AO_SETTINGS_PROPERTY->items[n].number.value)
+#define STAT(n)																(AGENT_AO_STATS_PROPERTY->items[n].number.value)
+
+// -------------------------------------------------------------------------------- helpers
+
+static inline bool aborted(indigo_device *device) {
+	return AGENT_ABORT_PROCESS_PROPERTY->state == INDIGO_BUSY_STATE;
+}
+
+static inline bool ao_absolute(indigo_device *device) {
+	return AGENT_AO_MODE_ABSOLUTE_ITEM->sw.value;
+}
+
+static inline double limit_to(double value, double limit) {
+	return value > limit ? limit : (value < -limit ? -limit : value);
+}
+
+// The deflection of the AO (the distance of its position from the centre, in steps or percent) is limited to keep the tilt of the optics under control
+static inline double deflection_limit(indigo_device *device) {
+	return SET(S_RANGE) * SET(S_MAX_DEFLECTION) / 100;
+}
+
+static void save_config(indigo_device *device) {
+	if (pthread_mutex_trylock(&DEVICE_CONTEXT->config_mutex) == 0) {
+		pthread_mutex_unlock(&DEVICE_CONTEXT->config_mutex);
+		pthread_mutex_lock(&DEVICE_PRIVATE_DATA->mutex);
+		indigo_save_property(device, NULL, AGENT_AO_SETTINGS_PROPERTY);
+		indigo_save_property(device, NULL, AGENT_AO_MODE_PROPERTY);
+		indigo_save_property(device, NULL, AGENT_AO_BUMP_MODE_PROPERTY);
+		indigo_save_property(device, NULL, AGENT_AO_DEC_MODE_PROPERTY);
+		if (DEVICE_CONTEXT->property_save_file_handle != NULL) {
+			CONFIG_PROPERTY->state = INDIGO_OK_STATE;
+			indigo_uni_close(&DEVICE_CONTEXT->property_save_file_handle);
+		} else {
+			CONFIG_PROPERTY->state = INDIGO_ALERT_STATE;
+		}
+		CONFIG_SAVE_ITEM->sw.value = false;
+		indigo_update_property(device, CONFIG_PROPERTY, NULL);
+		pthread_mutex_unlock(&DEVICE_PRIVATE_DATA->mutex);
+	}
+}
+
+static void update_stats(indigo_device *device) {
+	STAT(T_POSITION_RA) = round(1000 * DEVICE_PRIVATE_DATA->pos_ra) / 1000;
+	STAT(T_POSITION_DEC) = round(1000 * DEVICE_PRIVATE_DATA->pos_dec) / 1000;
+	STAT(T_SATURATED) = DEVICE_PRIVATE_DATA->saturated ? 1 : 0;
+	STAT(T_LOST) = DEVICE_PRIVATE_DATA->lost_frames;
+	STAT(T_BACKEND) = DEVICE_PRIVATE_DATA->backend;
+	indigo_update_property(device, AGENT_AO_STATS_PROPERTY, NULL);
+}
+
+static void set_phase(indigo_device *device, int phase) {
+	DEVICE_PRIVATE_DATA->process = phase;
+	STAT(T_PHASE) = phase;
+	update_stats(device);
+}
+
+static double get_pixel_scale(indigo_device *device) {
+	return 3600 * sqrt(CCD_LENS_FOV_PIXEL_SCALE_WIDTH_ITEM->number.value * CCD_LENS_FOV_PIXEL_SCALE_HEIGHT_ITEM->number.value);
+}
+
+// -------------------------------------------------------------------------------- AO matrix and sky frame
+
+static bool ao_calibrated(indigo_device *device) {
+	return fabs(SET(S_RA_X) * SET(S_DEC_Y) - SET(S_RA_Y) * SET(S_DEC_X)) > 1e-9;
+}
+
+// star displacement caused by an AO deflection
+static void steps_to_px(indigo_device *device, double ra, double dec, double *x, double *y) {
+	*x = SET(S_RA_X) * ra + SET(S_DEC_X) * dec;
+	*y = SET(S_RA_Y) * ra + SET(S_DEC_Y) * dec;
+}
+
+// AO deflection that moves the star by a displacement
+static void px_to_steps(indigo_device *device, double x, double y, double *ra, double *dec) {
+	double det = SET(S_RA_X) * SET(S_DEC_Y) - SET(S_RA_Y) * SET(S_DEC_X);
+	*ra = (SET(S_DEC_Y) * x - SET(S_DEC_X) * y) / det;
+	*dec = (-SET(S_RA_Y) * x + SET(S_RA_X) * y) / det;
+}
+
+static bool mount_calibrated(indigo_device *device) {
+	return SET(S_SPEED_RA) > 0 && fabs(SET(S_SPEED_DEC)) > 0;
+}
+
+// the angle turns by 180 degrees after a meridian flip, like the angle of the Guider Agent
+static double oag_angle(indigo_device *device) {
+	double angle = SET(S_OAG_ANGLE);
+	int calibrated = (int)SET(S_OAG_SOP);
+	if (calibrated != 0 && DEVICE_PRIVATE_DATA->mount_sop != 0 && calibrated != DEVICE_PRIVATE_DATA->mount_sop) {
+		angle += 180;
+	}
+	return angle;
+}
+
+static double oag_parity(indigo_device *device) {
+	return SET(S_SPEED_DEC) < 0 ? -1 : 1;
+}
+
+// displacement in OAG pixels to pixels along the RA axis and the Dec axis
+static void px_to_sky(indigo_device *device, double x, double y, double *ra, double *dec) {
+	double angle = -M_PI * oag_angle(device) / 180;
+	*ra = x * cos(angle) + y * sin(angle);
+	*dec = oag_parity(device) * (x * sin(angle) - y * cos(angle));
+}
+
+static void sky_to_px(indigo_device *device, double ra, double dec, double *x, double *y) {
+	double angle = -M_PI * oag_angle(device) / 180;
+	dec *= oag_parity(device);
+	*x = ra * cos(angle) + dec * sin(angle);
+	*y = ra * sin(angle) - dec * cos(angle);
+}
+
+// -------------------------------------------------------------------------------- frames
+
+static void frames_reset(indigo_device *device) {
+	DEVICE_PRIVATE_DATA->locked = false;
+	DEVICE_PRIVATE_DATA->lost_frames = 0;
+	DEVICE_PRIVATE_DATA->rmse_x_sum = DEVICE_PRIVATE_DATA->rmse_y_sum = 0;
+	DEVICE_PRIVATE_DATA->rmse_count = 0;
+}
+
+static bool start_frames(indigo_device *device) {
+	if (!INDIGO_FILTER_CCD_SELECTED) {
+		indigo_send_message(device, ALERT_PROPERTY, "No camera selected");
+		return false;
+	}
+	pthread_mutex_lock(&DEVICE_PRIVATE_DATA->frame_mutex);
+	DEVICE_PRIVATE_DATA->frames_wanted = true;
+	pthread_mutex_unlock(&DEVICE_PRIVATE_DATA->frame_mutex);
+	DEVICE_PRIVATE_DATA->saved_upload_mode = indigo_save_switch_state(device, CCD_UPLOAD_MODE_PROPERTY_NAME, CCD_UPLOAD_MODE_CLIENT_ITEM_NAME);
+	DEVICE_PRIVATE_DATA->saved_image_format = indigo_save_switch_state(device, CCD_IMAGE_FORMAT_PROPERTY_NAME, CCD_IMAGE_FORMAT_RAW_ITEM_NAME);
+	DEVICE_PRIVATE_DATA->streaming = false;
+	if (DEVICE_PRIVATE_DATA->has_streaming) {
+		static const char *names[] = { CCD_STREAMING_EXPOSURE_ITEM_NAME, CCD_STREAMING_COUNT_ITEM_NAME };
+		double values[] = { SET(S_EXPOSURE), -1 };
+		DEVICE_PRIVATE_DATA->streaming_state = INDIGO_IDLE_STATE;
+		indigo_change_number_property(FILTER_DEVICE_CONTEXT->client, device->name, CCD_STREAMING_PROPERTY_NAME, 2, names, values);
+		for (int i = 0; i < 3000 && DEVICE_PRIVATE_DATA->streaming_state != INDIGO_BUSY_STATE && !aborted(device); i++) {
+			indigo_usleep(1000);
+		}
+		DEVICE_PRIVATE_DATA->streaming = DEVICE_PRIVATE_DATA->streaming_state == INDIGO_BUSY_STATE;
+		if (!DEVICE_PRIVATE_DATA->streaming) {
+			indigo_send_message(device, BUSY_PROPERTY, "Streaming did not start, using single exposures");
+		}
+	}
+	frames_reset(device);
+	return true;
+}
+
+static void stop_frames(indigo_device *device) {
+	pthread_mutex_lock(&DEVICE_PRIVATE_DATA->frame_mutex);
+	bool started = DEVICE_PRIVATE_DATA->frames_wanted;
+	DEVICE_PRIVATE_DATA->frames_wanted = false;
+	pthread_mutex_unlock(&DEVICE_PRIVATE_DATA->frame_mutex);
+	if (!started) {
+		return;
+	}
+	if (DEVICE_PRIVATE_DATA->streaming) {
+		indigo_change_switch_property_1(FILTER_DEVICE_CONTEXT->client, device->name, CCD_ABORT_EXPOSURE_PROPERTY_NAME, CCD_ABORT_EXPOSURE_ITEM_NAME, true);
+		for (int i = 0; i < 3000 && DEVICE_PRIVATE_DATA->streaming_state == INDIGO_BUSY_STATE; i++) {
+			indigo_usleep(1000);
+		}
+		DEVICE_PRIVATE_DATA->streaming = false;
+	}
+	indigo_restore_switch_state(device, CCD_UPLOAD_MODE_PROPERTY_NAME, DEVICE_PRIVATE_DATA->saved_upload_mode);
+	indigo_restore_switch_state(device, CCD_IMAGE_FORMAT_PROPERTY_NAME, DEVICE_PRIVATE_DATA->saved_image_format);
+}
+
+// Waits for the next image, copies it to the work buffer and validates it
+static bool get_frame(indigo_device *device, double timeout) {
+	unsigned long serial = DEVICE_PRIVATE_DATA->frame_serial;
+	if (!DEVICE_PRIVATE_DATA->streaming) {
+		indigo_change_number_property_1(FILTER_DEVICE_CONTEXT->client, device->name, CCD_EXPOSURE_PROPERTY_NAME, CCD_EXPOSURE_ITEM_NAME, SET(S_EXPOSURE));
+	}
+	double deadline = indigo_monotonic_time() + timeout + (DEVICE_PRIVATE_DATA->streaming ? 0 : SET(S_EXPOSURE));
+	while (DEVICE_PRIVATE_DATA->frame_serial == serial) {
+		if (aborted(device) || indigo_monotonic_time() > deadline) {
+			return false;
+		}
+		indigo_usleep(1000);
+	}
+	pthread_mutex_lock(&DEVICE_PRIVATE_DATA->frame_mutex);
+	if (DEVICE_PRIVATE_DATA->frame_url[0]) {
+		char url[INDIGO_VALUE_SIZE];
+		INDIGO_COPY_VALUE(url, DEVICE_PRIVATE_DATA->frame_url);
+		pthread_mutex_unlock(&DEVICE_PRIVATE_DATA->frame_mutex);
+		void *data = NULL;
+		long size = 0;
+		if (!indigo_download_blob(url, &data, &size, NULL) || data == NULL) {
+			indigo_safe_free(data);
+			return false;
+		}
+		if (size > DEVICE_PRIVATE_DATA->work_capacity) {
+			DEVICE_PRIVATE_DATA->work_data = indigo_safe_realloc(DEVICE_PRIVATE_DATA->work_data, size);
+			DEVICE_PRIVATE_DATA->work_capacity = size;
+		}
+		memcpy(DEVICE_PRIVATE_DATA->work_data, data, size);
+		DEVICE_PRIVATE_DATA->work_size = size;
+		free(data);
+	} else {
+		if (DEVICE_PRIVATE_DATA->frame_size > DEVICE_PRIVATE_DATA->work_capacity) {
+			DEVICE_PRIVATE_DATA->work_data = indigo_safe_realloc(DEVICE_PRIVATE_DATA->work_data, DEVICE_PRIVATE_DATA->frame_size);
+			DEVICE_PRIVATE_DATA->work_capacity = DEVICE_PRIVATE_DATA->frame_size;
+		}
+		memcpy(DEVICE_PRIVATE_DATA->work_data, DEVICE_PRIVATE_DATA->frame_data, DEVICE_PRIVATE_DATA->frame_size);
+		DEVICE_PRIVATE_DATA->work_size = DEVICE_PRIVATE_DATA->frame_size;
+		pthread_mutex_unlock(&DEVICE_PRIVATE_DATA->frame_mutex);
+	}
+	indigo_raw_header *header = (indigo_raw_header *)DEVICE_PRIVATE_DATA->work_data;
+	if (header == NULL || DEVICE_PRIVATE_DATA->work_size < (long)sizeof(indigo_raw_header)) {
+		return false;
+	}
+	size_t bytes_per_pixel;
+	switch (header->signature) {
+		case INDIGO_RAW_MONO8: bytes_per_pixel = 1; break;
+		case INDIGO_RAW_MONO16: bytes_per_pixel = 2; break;
+		case INDIGO_RAW_RGB24: bytes_per_pixel = 3; break;
+		case INDIGO_RAW_RGB48: bytes_per_pixel = 6; break;
+		default: return false;
+	}
+	if (header->width == 0 || header->height == 0 || header->width > INT_MAX / bytes_per_pixel || header->height > INT_MAX / bytes_per_pixel / header->width) {
+		return false;
+	}
+	size_t pixel_bytes = (size_t)header->width * header->height * bytes_per_pixel;
+	return pixel_bytes <= (size_t)DEVICE_PRIVATE_DATA->work_size - sizeof(indigo_raw_header);
+}
+
+// -------------------------------------------------------------------------------- tracker
+
+// Displacement of the star against the reference, locks on the brightest star of the first frame
+static bool analyze_frame(indigo_device *device, double *dx, double *dy) {
+	indigo_raw_header *header = (indigo_raw_header *)DEVICE_PRIVATE_DATA->work_data;
+	char *data = (char *)header + sizeof(indigo_raw_header);
+	int radius = (int)SET(S_RADIUS);
+	int width = (int)header->width;
+	int height = (int)header->height;
+	if (DEVICE_PRIVATE_DATA->locked && (DEVICE_PRIVATE_DATA->lock_width != width || DEVICE_PRIVATE_DATA->lock_height != height)) {
+		DEVICE_PRIVATE_DATA->locked = false;
+	}
+	if (!DEVICE_PRIVATE_DATA->locked) {
+		int found = 0;
+		if (indigo_find_stars_precise(header->signature, data, radius, width, height, MAX_STARS, DEVICE_PRIVATE_DATA->stars, &found) != INDIGO_OK || found == 0) {
+			return false;
+		}
+		int best = -1;
+		for (int i = 0; i < found; i++) {
+			indigo_star_detection *star = DEVICE_PRIVATE_DATA->stars + i;
+			if (star->oversaturated || star->close_to_other) {
+				continue;
+			}
+			if (best < 0 || star->luminance > DEVICE_PRIVATE_DATA->stars[best].luminance) {
+				best = i;
+			}
+		}
+		if (best < 0) {
+			best = 0;
+		}
+		DEVICE_PRIVATE_DATA->star_x = DEVICE_PRIVATE_DATA->stars[best].x;
+		DEVICE_PRIVATE_DATA->star_y = DEVICE_PRIVATE_DATA->stars[best].y;
+		if (indigo_selection_frame_digest_iterative(header->signature, data, &DEVICE_PRIVATE_DATA->star_x, &DEVICE_PRIVATE_DATA->star_y, radius, width, height, &DEVICE_PRIVATE_DATA->reference, 3) != INDIGO_OK) {
+			return false;
+		}
+		DEVICE_PRIVATE_DATA->lock_width = width;
+		DEVICE_PRIVATE_DATA->lock_height = height;
+		DEVICE_PRIVATE_DATA->locked = true;
+		DEVICE_PRIVATE_DATA->snr = DEVICE_PRIVATE_DATA->reference.snr;
+		*dx = *dy = 0;
+		return true;
+	}
+	indigo_frame_digest digest = { 0 };
+	if (indigo_selection_frame_digest_iterative(header->signature, data, &DEVICE_PRIVATE_DATA->star_x, &DEVICE_PRIVATE_DATA->star_y, radius, width, height, &digest, 1) != INDIGO_OK) {
+		indigo_delete_frame_digest(&digest);
+		return false;
+	}
+	*dx = digest.centroid_x - DEVICE_PRIVATE_DATA->reference.centroid_x;
+	*dy = digest.centroid_y - DEVICE_PRIVATE_DATA->reference.centroid_y;
+	DEVICE_PRIVATE_DATA->snr = digest.snr;
+	indigo_delete_frame_digest(&digest);
+	return true;
+}
+
+// Mean displacement of several frames
+static bool measure_average(indigo_device *device, int frames, double *x, double *y) {
+	double sum_x = 0, sum_y = 0;
+	for (int i = 0; i < frames; i++) {
+		double dx, dy;
+		if (!get_frame(device, FRAME_TIMEOUT) || !analyze_frame(device, &dx, &dy)) {
+			return false;
+		}
+		sum_x += dx;
+		sum_y += dy;
+	}
+	*x = sum_x / frames;
+	*y = sum_y / frames;
+	return true;
+}
+
+static void relock(indigo_device *device) {
+	DEVICE_PRIVATE_DATA->locked = false;
+	DEVICE_PRIVATE_DATA->lost_frames = 0;
+}
+
+// -------------------------------------------------------------------------------- AO
+
+static indigo_property_state wait_update(volatile unsigned *serial, unsigned before, volatile indigo_property_state *state, double timeout, indigo_device *device) {
+	double deadline = indigo_monotonic_time() + timeout;
+	while (indigo_monotonic_time() < deadline) {
+		if (*serial != before && *state != INDIGO_BUSY_STATE) {
+			return *state;
+		}
+		indigo_usleep(1000);
+	}
+	return INDIGO_ALERT_STATE;
+}
+
+// One request to the AO axes, the values are steps (relative) or percent (absolute), positive along EAST and NORTH.
+// A relative AO is not asked for a zero move, an absolute one centers an axis with a zero request.
+static bool ao_request(indigo_device *device, double ra, double dec) {
+	static const char *ra_names[] = { AO_GUIDE_EAST_ITEM_NAME, AO_GUIDE_WEST_ITEM_NAME };
+	static const char *dec_names[] = { AO_GUIDE_NORTH_ITEM_NAME, AO_GUIDE_SOUTH_ITEM_NAME };
+	double ra_values[] = { ra > 0 ? ra : 0, ra < 0 ? -ra : 0 };
+	double dec_values[] = { dec > 0 ? dec : 0, dec < 0 ? -dec : 0 };
+	bool ra_sent = ao_absolute(device) || ra != 0;
+	bool dec_sent = ao_absolute(device) || dec != 0;
+	unsigned ra_before = DEVICE_PRIVATE_DATA->ao_ra_serial;
+	unsigned dec_before = DEVICE_PRIVATE_DATA->ao_dec_serial;
+	if (ra_sent) {
+		indigo_change_number_property(FILTER_DEVICE_CONTEXT->client, device->name, AO_GUIDE_RA_PROPERTY_NAME, 2, ra_names, ra_values);
+	}
+	if (dec_sent) {
+		indigo_change_number_property(FILTER_DEVICE_CONTEXT->client, device->name, AO_GUIDE_DEC_PROPERTY_NAME, 2, dec_names, dec_values);
+	}
+	double timeout = SET(S_AO_TIMEOUT);
+	indigo_property_state ra_state = ra_sent ? wait_update(&DEVICE_PRIVATE_DATA->ao_ra_serial, ra_before, &DEVICE_PRIVATE_DATA->ao_ra_state, timeout, device) : INDIGO_OK_STATE;
+	indigo_property_state dec_state = dec_sent ? wait_update(&DEVICE_PRIVATE_DATA->ao_dec_serial, dec_before, &DEVICE_PRIVATE_DATA->ao_dec_state, timeout, device) : INDIGO_OK_STATE;
+	if (ra_state == INDIGO_ALERT_STATE || dec_state == INDIGO_ALERT_STATE) {
+		DEVICE_PRIVATE_DATA->saturated = true;
+		return false;
+	}
+	return true;
+}
+
+// Moves the AO to a position. A relative AO is moved by integer steps, the position is the sum of the steps made.
+static bool ao_move_to(indigo_device *device, double ra, double dec) {
+	double limit = deflection_limit(device);
+	double norm = hypot(ra, dec);
+	if (norm > limit) {
+		ra *= limit / norm;
+		dec *= limit / norm;
+	}
+	DEVICE_PRIVATE_DATA->want_ra = ra;
+	DEVICE_PRIVATE_DATA->want_dec = dec;
+	bool ok = true;
+	if (ao_absolute(device)) {
+		if (fabs(ra - DEVICE_PRIVATE_DATA->pos_ra) < 1e-6 && fabs(dec - DEVICE_PRIVATE_DATA->pos_dec) < 1e-6) {
+			return true;
+		}
+		ok = ao_request(device, ra, dec);
+		DEVICE_PRIVATE_DATA->pos_ra = ra;
+		DEVICE_PRIVATE_DATA->pos_dec = dec;
+	} else {
+		double max_step = SET(S_MAX_STEP);
+		for (int i = 0; i < 1000; i++) {
+			double delta_ra = round(ra - DEVICE_PRIVATE_DATA->pos_ra);
+			double delta_dec = round(dec - DEVICE_PRIVATE_DATA->pos_dec);
+			if (delta_ra == 0 && delta_dec == 0) {
+				break;
+			}
+			delta_ra = limit_to(delta_ra, max_step);
+			delta_dec = limit_to(delta_dec, max_step);
+			ok = ao_request(device, delta_ra, delta_dec);
+			DEVICE_PRIVATE_DATA->pos_ra += delta_ra;
+			DEVICE_PRIVATE_DATA->pos_dec += delta_dec;
+			if (!ok || aborted(device)) {
+				break;
+			}
+		}
+	}
+	return ok;
+}
+
+static bool ao_center(indigo_device *device) {
+	if (indigo_change_switch_property_1(FILTER_DEVICE_CONTEXT->client, device->name, AO_RESET_PROPERTY_NAME, AO_CENTER_ITEM_NAME, true) != INDIGO_OK) {
+		return false;
+	}
+	indigo_usleep(50000);
+	for (int i = 0; i < (int)(SET(S_AO_TIMEOUT) * 100) && (DEVICE_PRIVATE_DATA->ao_ra_state == INDIGO_BUSY_STATE || DEVICE_PRIVATE_DATA->ao_dec_state == INDIGO_BUSY_STATE); i++) {
+		indigo_usleep(10000);
+	}
+	DEVICE_PRIVATE_DATA->pos_ra = DEVICE_PRIVATE_DATA->pos_dec = 0;
+	DEVICE_PRIVATE_DATA->want_ra = DEVICE_PRIVATE_DATA->want_dec = 0;
+	DEVICE_PRIVATE_DATA->saturated = false;
+	return true;
+}
+
+// -------------------------------------------------------------------------------- mount
+
+static bool pulse_guide(indigo_device *device, double ra_seconds, double dec_seconds) {
+	static const char *ra_names[] = { GUIDER_GUIDE_WEST_ITEM_NAME, GUIDER_GUIDE_EAST_ITEM_NAME };
+	static const char *dec_names[] = { GUIDER_GUIDE_NORTH_ITEM_NAME, GUIDER_GUIDE_SOUTH_ITEM_NAME };
+	double ra_values[] = { ra_seconds > 0 ? 1000 * ra_seconds : 0, ra_seconds < 0 ? -1000 * ra_seconds : 0 };
+	double dec_values[] = { dec_seconds > 0 ? 1000 * dec_seconds : 0, dec_seconds < 0 ? -1000 * dec_seconds : 0 };
+	unsigned ra_before = DEVICE_PRIVATE_DATA->guide_ra_serial;
+	unsigned dec_before = DEVICE_PRIVATE_DATA->guide_dec_serial;
+	bool ra_sent = ra_seconds != 0;
+	bool dec_sent = dec_seconds != 0;
+	if (ra_sent) {
+		indigo_change_number_property(FILTER_DEVICE_CONTEXT->client, device->name, GUIDER_GUIDE_RA_PROPERTY_NAME, 2, ra_names, ra_values);
+	}
+	if (dec_sent) {
+		indigo_change_number_property(FILTER_DEVICE_CONTEXT->client, device->name, GUIDER_GUIDE_DEC_PROPERTY_NAME, 2, dec_names, dec_values);
+	}
+	double timeout = fmax(fabs(ra_seconds), fabs(dec_seconds)) + 5;
+	bool ok = true;
+	if (ra_sent) {
+		ok = wait_update(&DEVICE_PRIVATE_DATA->guide_ra_serial, ra_before, &DEVICE_PRIVATE_DATA->guide_ra_state, timeout, device) == INDIGO_OK_STATE;
+	}
+	if (dec_sent) {
+		ok = (wait_update(&DEVICE_PRIVATE_DATA->guide_dec_serial, dec_before, &DEVICE_PRIVATE_DATA->guide_dec_state, timeout, device) == INDIGO_OK_STATE) && ok;
+	}
+	return ok;
+}
+
+static bool guider_agent_name(indigo_device *device, char *name) {
+	char *related = indigo_filter_first_related_agent(device, GUIDER_AGENT_PREFIX);
+	if (related == NULL) {
+		return false;
+	}
+	INDIGO_COPY_NAME(name, related);
+	return true;
+}
+
+// -------------------------------------------------------------------------------- bump
+
+static bool guider_agent_guiding(indigo_device *device) {
+	char name[INDIGO_NAME_SIZE];
+	return guider_agent_name(device, name) && DEVICE_PRIVATE_DATA->guider_start_state == INDIGO_BUSY_STATE && DEVICE_PRIVATE_DATA->guider_phase == INDIGO_GUIDER_PHASE_GUIDING && DEVICE_PRIVATE_DATA->guider_frame > 5;
+}
+
+static bool guider_agent_busy(indigo_device *device) {
+	char name[INDIGO_NAME_SIZE];
+	return guider_agent_name(device, name) && DEVICE_PRIVATE_DATA->guider_start_state == INDIGO_BUSY_STATE;
+}
+
+// The Guider Agent is the only one to move the mount while it calibrates, previews or guides
+static int select_backend(indigo_device *device) {
+	if (AGENT_AO_BUMP_MODE_OFF_ITEM->sw.value || !mount_calibrated(device) || DEVICE_PRIVATE_DATA->mount_slewing) {
+		return AGENT_AO_BACKEND_NONE;
+	}
+	bool guiding = guider_agent_guiding(device);
+	bool busy = guider_agent_busy(device);
+	if (AGENT_AO_BUMP_MODE_GUIDER_AGENT_ITEM->sw.value) {
+		return guiding && get_pixel_scale(device) > 0 ? AGENT_AO_BACKEND_GUIDER_AGENT : AGENT_AO_BACKEND_NONE;
+	}
+	if (AGENT_AO_BUMP_MODE_DIRECT_ITEM->sw.value) {
+		return !busy && INDIGO_FILTER_GUIDER_SELECTED ? AGENT_AO_BACKEND_DIRECT : AGENT_AO_BACKEND_NONE;
+	}
+	if (guiding && get_pixel_scale(device) > 0) {
+		return AGENT_AO_BACKEND_GUIDER_AGENT;
+	}
+	return !busy && INDIGO_FILTER_GUIDER_SELECTED ? AGENT_AO_BACKEND_DIRECT : AGENT_AO_BACKEND_NONE;
+}
+
+static void write_guider_target(indigo_device *device, double ra, double dec) {
+	char name[INDIGO_NAME_SIZE];
+	if (!guider_agent_name(device, name)) {
+		return;
+	}
+	static const char *names[] = { AGENT_GUIDER_TARGET_OFFSET_RA_ITEM_NAME, AGENT_GUIDER_TARGET_OFFSET_DEC_ITEM_NAME };
+	double values[] = { ra, dec };
+	indigo_change_number_property(FILTER_DEVICE_CONTEXT->client, name, AGENT_GUIDER_TARGET_OFFSET_PROPERTY_NAME, 2, names, values);
+	DEVICE_PRIVATE_DATA->sent_ra = ra;
+	DEVICE_PRIVATE_DATA->sent_dec = dec;
+	DEVICE_PRIVATE_DATA->write_time = indigo_monotonic_time();
+}
+
+// The Guider Agent starts over with a zero offset and a new reference: the part of the bump it realised is the new baseline
+static void rebase_guider(indigo_device *device) {
+	double scale = get_pixel_scale(device);
+	if (scale > 0 && (DEVICE_PRIVATE_DATA->sent_ra != 0 || DEVICE_PRIVATE_DATA->sent_dec != 0)) {
+		double x, y;
+		sky_to_px(device, DEVICE_PRIVATE_DATA->sent_ra / scale, DEVICE_PRIVATE_DATA->sent_dec / scale, &x, &y);
+		DEVICE_PRIVATE_DATA->base_x += x;
+		DEVICE_PRIVATE_DATA->base_y += y;
+	}
+	DEVICE_PRIVATE_DATA->sent_ra = DEVICE_PRIVATE_DATA->sent_dec = 0;
+	DEVICE_PRIVATE_DATA->guider_target_ra = DEVICE_PRIVATE_DATA->guider_target_dec = 0;
+}
+
+static void bump_reset(indigo_device *device) {
+	DEVICE_PRIVATE_DATA->bump_x = DEVICE_PRIVATE_DATA->bump_y = 0;
+	DEVICE_PRIVATE_DATA->base_x = DEVICE_PRIVATE_DATA->base_y = 0;
+	DEVICE_PRIVATE_DATA->done_x = DEVICE_PRIVATE_DATA->done_y = 0;
+	DEVICE_PRIVATE_DATA->sent_ra = DEVICE_PRIVATE_DATA->sent_dec = 0;
+	DEVICE_PRIVATE_DATA->bump_time = 0;
+	if (DEVICE_PRIVATE_DATA->backend == AGENT_AO_BACKEND_GUIDER_AGENT) {
+		write_guider_target(device, 0, 0);
+	}
+	STAT(T_BUMP_RA_S) = STAT(T_BUMP_DEC_S) = 0;
+}
+
+static void handover(indigo_device *device, int backend) {
+	int previous = DEVICE_PRIVATE_DATA->backend;
+	if (previous == AGENT_AO_BACKEND_GUIDER_AGENT) {
+		// the mount stays where the Guider Agent moved it
+		DEVICE_PRIVATE_DATA->done_x = DEVICE_PRIVATE_DATA->bump_x;
+		DEVICE_PRIVATE_DATA->done_y = DEVICE_PRIVATE_DATA->bump_y;
+		write_guider_target(device, 0, 0);
+	}
+	if (backend == AGENT_AO_BACKEND_GUIDER_AGENT) {
+		// what the direct pulses moved is part of the new reference of the Guider Agent
+		DEVICE_PRIVATE_DATA->base_x = DEVICE_PRIVATE_DATA->done_x;
+		DEVICE_PRIVATE_DATA->base_y = DEVICE_PRIVATE_DATA->done_y;
+		DEVICE_PRIVATE_DATA->sent_ra = DEVICE_PRIVATE_DATA->sent_dec = 0;
+	}
+	DEVICE_PRIVATE_DATA->backend = backend;
+	indigo_send_message(device, IDLE_PROPERTY, backend == AGENT_AO_BACKEND_GUIDER_AGENT ? "Mount bump goes through the Guider Agent" : (backend == AGENT_AO_BACKEND_DIRECT ? "Mount bump sends guide pulses" : "Mount bump is off"));
+}
+
+// One step of the slow loop: the total displacement T integrates the deflection of the AO and is realised by the active back-end
+static void bump_step(indigo_device *device, double dt) {
+	int backend = select_backend(device);
+	if (backend != DEVICE_PRIVATE_DATA->backend) {
+		handover(device, backend);
+	}
+	if (backend == AGENT_AO_BACKEND_NONE) {
+		return;
+	}
+	double a_x, a_y;
+	steps_to_px(device, DEVICE_PRIVATE_DATA->pos_ra, DEVICE_PRIVATE_DATA->pos_dec, &a_x, &a_y);
+	double factor = SET(S_BUMP_GAIN) * dt / SET(S_BUMP_TAU);
+	DEVICE_PRIVATE_DATA->bump_x += a_x * factor;
+	DEVICE_PRIVATE_DATA->bump_y += a_y * factor;
+	double now = indigo_monotonic_time();
+	if (backend == AGENT_AO_BACKEND_GUIDER_AGENT) {
+		double scale = get_pixel_scale(device);
+		double ra, dec;
+		px_to_sky(device, DEVICE_PRIVATE_DATA->bump_x - DEVICE_PRIVATE_DATA->base_x, DEVICE_PRIVATE_DATA->bump_y - DEVICE_PRIVATE_DATA->base_y, &ra, &dec);
+		ra = limit_to(ra * scale, MAX_TARGET_ARCSEC);
+		dec = limit_to(dec * scale, MAX_TARGET_ARCSEC);
+		STAT(T_BUMP_RA_S) = round(1000 * ra) / 1000;
+		STAT(T_BUMP_DEC_S) = round(1000 * dec) / 1000;
+		// the Guider Agent zeroes the offset when it takes a new reference
+		if (DEVICE_PRIVATE_DATA->write_time > 0 && now - DEVICE_PRIVATE_DATA->write_time > 1 && (fabs(DEVICE_PRIVATE_DATA->guider_target_ra - DEVICE_PRIVATE_DATA->sent_ra) > 0.05 || fabs(DEVICE_PRIVATE_DATA->guider_target_dec - DEVICE_PRIVATE_DATA->sent_dec) > 0.05)) {
+			rebase_guider(device);
+			return;
+		}
+		if (now - DEVICE_PRIVATE_DATA->write_time >= 0.5 && (fabs(ra - DEVICE_PRIVATE_DATA->sent_ra) > 0.02 || fabs(dec - DEVICE_PRIVATE_DATA->sent_dec) > 0.02)) {
+			write_guider_target(device, ra, dec);
+		}
+		return;
+	}
+	double ra_px, dec_px;
+	px_to_sky(device, DEVICE_PRIVATE_DATA->bump_x - DEVICE_PRIVATE_DATA->done_x, DEVICE_PRIVATE_DATA->bump_y - DEVICE_PRIVATE_DATA->done_y, &ra_px, &dec_px);
+	STAT(T_BUMP_RA_S) = round(1000 * ra_px * get_pixel_scale(device)) / 1000;
+	STAT(T_BUMP_DEC_S) = round(1000 * dec_px * get_pixel_scale(device)) / 1000;
+	double threshold = SET(S_BUMP_THRESHOLD);
+	if (now - DEVICE_PRIVATE_DATA->bump_pulse_time < SET(S_BUMP_INTERVAL) || (fabs(ra_px) < threshold && fabs(dec_px) < threshold)) {
+		return;
+	}
+	double cos_dec = cos(M_PI * DEVICE_PRIVATE_DATA->mount_dec / 180);
+	if (cos_dec < 0.05) {
+		cos_dec = 0.05;
+	}
+	double ra_s = fabs(ra_px) >= threshold ? ra_px / (SET(S_SPEED_RA) * cos_dec) : 0;
+	double dec_s = fabs(dec_px) >= threshold ? dec_px / fabs(SET(S_SPEED_DEC)) : 0;
+	if ((AGENT_AO_DEC_MODE_NORTH_ITEM->sw.value && dec_s < 0) || (AGENT_AO_DEC_MODE_SOUTH_ITEM->sw.value && dec_s > 0)) {
+		dec_s = 0;
+	}
+	ra_s = limit_to(ra_s, SET(S_MAX_PULSE));
+	dec_s = limit_to(dec_s, SET(S_MAX_PULSE));
+	if (fabs(ra_s) < SET(S_MIN_PULSE)) {
+		ra_s = 0;
+	}
+	if (fabs(dec_s) < SET(S_MIN_PULSE)) {
+		dec_s = 0;
+	}
+	if (ra_s == 0 && dec_s == 0) {
+		return;
+	}
+	// nothing but this agent moves the mount here, but a process of the Guider Agent may have started meanwhile
+	if (guider_agent_busy(device)) {
+		return;
+	}
+	DEVICE_PRIVATE_DATA->bump_pulse_time = now;
+	if (pulse_guide(device, ra_s, dec_s)) {
+		double x, y;
+		sky_to_px(device, ra_s * SET(S_SPEED_RA) * cos_dec, dec_s * fabs(SET(S_SPEED_DEC)), &x, &y);
+		DEVICE_PRIVATE_DATA->done_x += x;
+		DEVICE_PRIVATE_DATA->done_y += y;
+	}
+}
+
+// -------------------------------------------------------------------------------- processes
+
+static void process_begin(indigo_device *device, int phase) {
+	FILTER_DEVICE_CONTEXT->running_process = true;
+	set_phase(device, phase);
+}
+
+static void process_end(indigo_device *device, bool ok, const char *message) {
+	bool was_aborted = aborted(device);
+	set_phase(device, was_aborted ? AGENT_AO_PHASE_IDLE : (ok ? AGENT_AO_PHASE_DONE : AGENT_AO_PHASE_FAILED));
+	for (int i = 0; i < AGENT_START_PROCESS_PROPERTY->count; i++) {
+		AGENT_START_PROCESS_PROPERTY->items[i].sw.value = false;
+	}
+	AGENT_START_PROCESS_PROPERTY->state = ok || was_aborted ? INDIGO_OK_STATE : INDIGO_ALERT_STATE;
+	indigo_update_property(device, AGENT_START_PROCESS_PROPERTY, message);
+	if (was_aborted) {
+		AGENT_ABORT_PROCESS_PROPERTY->state = INDIGO_OK_STATE;
+		indigo_update_property(device, AGENT_ABORT_PROCESS_PROPERTY, NULL);
+	}
+	FILTER_DEVICE_CONTEXT->running_process = false;
+}
+
+static bool ao_ready(indigo_device *device) {
+	if (!INDIGO_FILTER_AO_SELECTED) {
+		indigo_send_message(device, ALERT_PROPERTY, "No active optics selected");
+		return false;
+	}
+	return true;
+}
+
+static void center_process(indigo_device *device) {
+	process_begin(device, AGENT_AO_PHASE_CENTERING);
+	bool ok = ao_ready(device) && ao_center(device);
+	bump_reset(device);
+	process_end(device, ok, ok ? "AO centered" : "AO centering failed");
+}
+
+// Visits the four corners and the centre of the range with an interval, the AO can be watched in the camera of the OAG
+static void exercise_process(indigo_device *device) {
+	process_begin(device, AGENT_AO_PHASE_EXERCISING);
+	bool ok = ao_ready(device) && ao_center(device);
+	// 100 % puts the corners at the maximum deflection
+	double amplitude = deflection_limit(device) * SET(S_EX_AMPLITUDE) / 100 / sqrt(2);
+	static const int corners[5][2] = { { 1, 1 }, { 1, -1 }, { -1, -1 }, { -1, 1 }, { 0, 0 } };
+	int cycles = (int)SET(S_EX_CYCLES);
+	for (int cycle = 0; ok && (cycles == 0 || cycle < cycles) && !aborted(device); cycle++) {
+		for (int i = 0; ok && i < 5 && !aborted(device); i++) {
+			ok = ao_move_to(device, corners[i][0] * amplitude, corners[i][1] * amplitude);
+			update_stats(device);
+			for (double waited = 0; waited < SET(S_EX_INTERVAL) && !aborted(device); waited += 0.05) {
+				indigo_usleep(50000);
+			}
+		}
+	}
+	bool centered = ao_ready(device) && ao_center(device);
+	process_end(device, ok && centered, ok ? "AO exercise finished" : "AO exercise failed");
+}
+
+// The AO is moved along both axes while the star is measured, the loop is open
+static void calibrate_process(indigo_device *device) {
+	process_begin(device, AGENT_AO_PHASE_CALIBRATING);
+	bool ok = ao_ready(device) && start_frames(device) && ao_center(device);
+	// the calibration moves must stay within the maximum deflection, the AO is not asked for more
+	double step = fmin(SET(S_CAL_STEP), deflection_limit(device));
+	double ra_x = 0, ra_y = 0, dec_x = 0, dec_y = 0;
+	int frames = (int)SET(S_CAL_FRAMES);
+	for (int attempt = 0; ok && attempt < 4 && !aborted(device); attempt++) {
+		double b0x, b0y, ax, ay, b1x, b1y, cx, cy, b2x, b2y;
+		double settle = SET(S_CAL_SETTLE);
+		ok = measure_average(device, frames, &b0x, &b0y);
+		ok = ok && ao_move_to(device, step, 0);
+		indigo_usleep((long)(settle * 1e6));
+		ok = ok && measure_average(device, frames, &ax, &ay);
+		ok = ok && ao_move_to(device, 0, 0);
+		indigo_usleep((long)(settle * 1e6));
+		ok = ok && measure_average(device, frames, &b1x, &b1y);
+		ok = ok && ao_move_to(device, 0, step);
+		indigo_usleep((long)(settle * 1e6));
+		ok = ok && measure_average(device, frames, &cx, &cy);
+		ok = ok && ao_move_to(device, 0, 0);
+		indigo_usleep((long)(settle * 1e6));
+		ok = ok && measure_average(device, frames, &b2x, &b2y);
+		if (!ok) {
+			break;
+		}
+		ra_x = (ax - (b0x + b1x) / 2) / step;
+		ra_y = (ay - (b0y + b1y) / 2) / step;
+		dec_x = (cx - (b1x + b2x) / 2) / step;
+		dec_y = (cy - (b1y + b2y) / 2) / step;
+		if (hypot(ra_x, ra_y) < 0.05 || hypot(dec_x, dec_y) < 0.05) {
+			if (step * 2 > deflection_limit(device)) {
+				ok = false;
+				indigo_send_message(device, ALERT_PROPERTY, "The star does not move with the AO, check the AO and the camera");
+				break;
+			}
+			step *= 2;
+			indigo_send_message(device, BUSY_PROPERTY, "Increasing the AO calibration step to %g", step);
+			ra_x = ra_y = dec_x = dec_y = 0;
+			continue;
+		}
+		break;
+	}
+	if (ok && !aborted(device)) {
+		double ra_scale = hypot(ra_x, ra_y);
+		double dec_scale = hypot(dec_x, dec_y);
+		double cos_angle = ra_scale > 0 && dec_scale > 0 ? (ra_x * dec_x + ra_y * dec_y) / (ra_scale * dec_scale) : 1;
+		if (ra_scale < 0.05 || dec_scale < 0.05) {
+			ok = false;
+		} else if (fabs(cos_angle) > 0.5) {
+			ok = false;
+			indigo_send_message(device, ALERT_PROPERTY, "The AO axes are not orthogonal in the image (cos = %.2f)", cos_angle);
+		} else {
+			SET(S_RA_X) = ra_x;
+			SET(S_RA_Y) = ra_y;
+			SET(S_DEC_X) = dec_x;
+			SET(S_DEC_Y) = dec_y;
+			SET(S_ANGLE) = round(1000 * 180 * atan2(-ra_y, ra_x) / M_PI) / 1000;
+			SET(S_SCALE_RA) = round(1000 * ra_scale) / 1000;
+			SET(S_SCALE_DEC) = round(1000 * dec_scale) / 1000;
+			indigo_update_property(device, AGENT_AO_SETTINGS_PROPERTY, NULL);
+			save_config(device);
+			indigo_send_message(device, OK_PROPERTY, "AO calibrated: %.3f px/step along RA, %.3f px/step along Dec", ra_scale, dec_scale);
+		}
+	}
+	stop_frames(device);
+	ao_center(device);
+	process_end(device, ok, ok ? "AO calibration finished" : "AO calibration failed");
+}
+
+// pulse and measurement of the star displacement it makes
+static bool pulse_and_measure(indigo_device *device, double ra_seconds, double dec_seconds, double *vx, double *vy) {
+	int frames = (int)SET(S_CAL_FRAMES);
+	double bx, by, ax, ay;
+	if (!measure_average(device, frames, &bx, &by) || !pulse_guide(device, ra_seconds, dec_seconds)) {
+		return false;
+	}
+	indigo_usleep(1000000);
+	if (!measure_average(device, frames, &ax, &ay)) {
+		return false;
+	}
+	*vx = ax - bx;
+	*vy = ay - by;
+	return true;
+}
+
+// The mount is pulsed in all directions while the AO holds the centre, which gives the orientation and the speed of the OAG image
+static void bump_calibrate_process(indigo_device *device) {
+	process_begin(device, AGENT_AO_PHASE_BUMP_CALIBRATING);
+	bool ok = true;
+	if (!INDIGO_FILTER_GUIDER_SELECTED) {
+		indigo_send_message(device, ALERT_PROPERTY, "No guider selected");
+		ok = false;
+	} else if (guider_agent_busy(device)) {
+		indigo_send_message(device, ALERT_PROPERTY, "The Guider Agent is busy");
+		ok = false;
+	}
+	ok = ok && ao_ready(device) && start_frames(device) && ao_center(device);
+	double pulse = SET(S_CAL_PULSE);
+	double north_x = 0, north_y = 0, south_x = 0, south_y = 0, west_x = 0, west_y = 0, east_x = 0, east_y = 0, ignored_x, ignored_y;
+	// the first north pulse takes up the backlash
+	ok = ok && pulse_and_measure(device, 0, pulse, &ignored_x, &ignored_y);
+	ok = ok && pulse_and_measure(device, 0, pulse, &north_x, &north_y);
+	ok = ok && pulse_and_measure(device, 0, -pulse, &south_x, &south_y);
+	ok = ok && pulse_and_measure(device, pulse, 0, &west_x, &west_y);
+	ok = ok && pulse_and_measure(device, -pulse, 0, &east_x, &east_y);
+	if (ok && !aborted(device)) {
+		double ra_x = (west_x - east_x) / 2 / pulse;
+		double ra_y = (west_y - east_y) / 2 / pulse;
+		double dec_x = (north_x - south_x) / 2 / pulse;
+		double dec_y = (north_y - south_y) / 2 / pulse;
+		double ra_speed = hypot(ra_x, ra_y);
+		double dec_speed = hypot(dec_x, dec_y);
+		if (ra_speed < 0.01 || dec_speed < 0.01) {
+			indigo_send_message(device, ALERT_PROPERTY, "The star does not move with the guide pulses, check the guide port, the camera and the AO");
+			ok = false;
+		} else {
+			double angle = atan2(-ra_y, ra_x);
+			double cos_dec = cos(M_PI * DEVICE_PRIVATE_DATA->mount_dec / 180);
+			if (cos_dec < 0.05) {
+				cos_dec = 0.05;
+			}
+			// positive Dec of the sky frame is the direction of the north pulse when the image is not mirrored
+			double parity = (dec_x * -sin(angle) + dec_y * -cos(angle)) >= 0 ? 1 : -1;
+			SET(S_OAG_ANGLE) = round(1000 * 180 * angle / M_PI) / 1000;
+			SET(S_SPEED_RA) = round(10000 * ra_speed / cos_dec) / 10000;
+			SET(S_SPEED_DEC) = parity * round(10000 * dec_speed) / 10000;
+			SET(S_OAG_SOP) = DEVICE_PRIVATE_DATA->mount_sop;
+			SET(S_OAG_COS_DEC) = cos_dec;
+			indigo_update_property(device, AGENT_AO_SETTINGS_PROPERTY, NULL);
+			save_config(device);
+			indigo_send_message(device, OK_PROPERTY, "OAG calibrated: angle %.1f deg, %.3f px/s along RA at the equator, %.3f px/s along Dec", SET(S_OAG_ANGLE), SET(S_SPEED_RA), dec_speed);
+		}
+	}
+	stop_frames(device);
+	ao_center(device);
+	process_end(device, ok, ok ? "OAG mount calibration finished" : "OAG mount calibration failed");
+}
+
+// The guider is about to move the main image on purpose, the loop must not cancel that
+static bool dither_active(indigo_device *device) {
+	return guider_agent_busy(device) && (DEVICE_PRIVATE_DATA->guider_dithering != 0 || DEVICE_PRIVATE_DATA->guider_dither_state == INDIGO_BUSY_STATE);
+}
+
+// The fast loop: every frame the AO is moved to reduce the displacement of the star, the slow loop bumps the mount
+static void tracking_process(indigo_device *device) {
+	process_begin(device, AGENT_AO_PHASE_TRACKING);
+	bool ok = ao_ready(device);
+	if (ok && !ao_calibrated(device)) {
+		indigo_send_message(device, ALERT_PROPERTY, "The AO is not calibrated");
+		ok = false;
+	}
+	ok = ok && start_frames(device) && ao_center(device);
+	bump_reset(device);
+	DEVICE_PRIVATE_DATA->backend = AGENT_AO_BACKEND_NONE;
+	bool frozen = false;
+	double last_time = indigo_monotonic_time();
+	DEVICE_PRIVATE_DATA->stats_time = last_time;
+	DEVICE_PRIVATE_DATA->rate_frames = 0;
+	while (ok && !aborted(device)) {
+		if (DEVICE_PRIVATE_DATA->mount_slewing || dither_active(device)) {
+			if (!frozen) {
+				frozen = true;
+				ao_center(device);
+				if (DEVICE_PRIVATE_DATA->mount_slewing) {
+					bump_reset(device);
+				}
+				indigo_send_message(device, BUSY_PROPERTY, DEVICE_PRIVATE_DATA->mount_slewing ? "Mount is slewing, the AO loop is paused" : "Dithering, the AO loop is paused");
+				update_stats(device);
+			}
+			indigo_usleep(100000);
+			continue;
+		}
+		if (frozen) {
+			frozen = false;
+			relock(device);
+			last_time = indigo_monotonic_time();
+		}
+		if (!get_frame(device, FRAME_TIMEOUT)) {
+			if (aborted(device)) {
+				break;
+			}
+			DEVICE_PRIVATE_DATA->lost_frames++;
+		} else {
+			double dx, dy;
+			if (analyze_frame(device, &dx, &dy)) {
+				DEVICE_PRIVATE_DATA->lost_frames = 0;
+				DEVICE_PRIVATE_DATA->rate_frames++;
+				double min_move = SET(S_MIN_MOVE);
+				if (hypot(dx, dy) >= min_move) {
+					double steps_ra, steps_dec;
+					px_to_steps(device, -SET(S_GAIN) * dx, -SET(S_GAIN) * dy, &steps_ra, &steps_dec);
+					double new_ra = DEVICE_PRIVATE_DATA->want_ra + steps_ra;
+					double new_dec = DEVICE_PRIVATE_DATA->want_dec + steps_dec;
+					DEVICE_PRIVATE_DATA->saturated = hypot(new_ra, new_dec) > deflection_limit(device);
+					ao_move_to(device, new_ra, new_dec);
+				}
+				DEVICE_PRIVATE_DATA->rmse_x_sum += dx * dx;
+				DEVICE_PRIVATE_DATA->rmse_y_sum += dy * dy;
+				DEVICE_PRIVATE_DATA->rmse_count++;
+				STAT(T_DRIFT_X) = round(1000 * dx) / 1000;
+				STAT(T_DRIFT_Y) = round(1000 * dy) / 1000;
+				STAT(T_SNR) = round(10 * DEVICE_PRIVATE_DATA->snr) / 10;
+			} else {
+				DEVICE_PRIVATE_DATA->lost_frames++;
+			}
+		}
+		double now = indigo_monotonic_time();
+		if (DEVICE_PRIVATE_DATA->lost_frames > (int)SET(S_LOST_FRAMES)) {
+			indigo_send_message(device, ALERT_PROPERTY, "The star is lost, the AO is centered and the loop looks for a star again");
+			ao_center(device);
+			relock(device);
+			DEVICE_PRIVATE_DATA->lost_frames = 0;
+		}
+		bump_step(device, now - last_time);
+		last_time = now;
+		if (now - DEVICE_PRIVATE_DATA->stats_time >= STATS_PERIOD) {
+			double a_x, a_y;
+			steps_to_px(device, DEVICE_PRIVATE_DATA->pos_ra, DEVICE_PRIVATE_DATA->pos_dec, &a_x, &a_y);
+			STAT(T_FRAME_RATE) = round(10 * DEVICE_PRIVATE_DATA->rate_frames / (now - DEVICE_PRIVATE_DATA->stats_time)) / 10;
+			if (DEVICE_PRIVATE_DATA->rmse_count > 0) {
+				STAT(T_RMSE_X) = round(1000 * sqrt(DEVICE_PRIVATE_DATA->rmse_x_sum / DEVICE_PRIVATE_DATA->rmse_count)) / 1000;
+				STAT(T_RMSE_Y) = round(1000 * sqrt(DEVICE_PRIVATE_DATA->rmse_y_sum / DEVICE_PRIVATE_DATA->rmse_count)) / 1000;
+			}
+			STAT(T_OFFSET_X) = round(1000 * a_x) / 1000;
+			STAT(T_OFFSET_Y) = round(1000 * a_y) / 1000;
+			update_stats(device);
+			DEVICE_PRIVATE_DATA->stats_time = now;
+			DEVICE_PRIVATE_DATA->rate_frames = 0;
+		}
+	}
+	if (DEVICE_PRIVATE_DATA->backend == AGENT_AO_BACKEND_GUIDER_AGENT) {
+		write_guider_target(device, 0, 0);
+	}
+	DEVICE_PRIVATE_DATA->backend = AGENT_AO_BACKEND_NONE;
+	stop_frames(device);
+	if (INDIGO_FILTER_AO_SELECTED) {
+		ao_center(device);
+	}
+	bump_reset(device);
+	process_end(device, ok, ok ? "AO loop stopped" : "AO loop failed");
+}
+
+// -------------------------------------------------------------------------------- snooping
+
+static void snoop_guider_agent(indigo_client *client, indigo_property *property) {
+	indigo_device *device = FILTER_CLIENT_CONTEXT->device;
+	char *related = indigo_filter_first_related_agent(device, GUIDER_AGENT_PREFIX);
+	if (related == NULL || strcmp(related, property->device)) {
+		return;
+	}
+	if (!strcmp(property->name, AGENT_GUIDER_STATS_PROPERTY_NAME)) {
+		for (int i = 0; i < property->count; i++) {
+			indigo_item *item = property->items + i;
+			if (!strcmp(item->name, AGENT_GUIDER_STATS_PHASE_ITEM_NAME)) {
+				CLIENT_PRIVATE_DATA->guider_phase = (int)item->number.value;
+			} else if (!strcmp(item->name, AGENT_GUIDER_STATS_FRAME_ITEM_NAME)) {
+				CLIENT_PRIVATE_DATA->guider_frame = (int)item->number.value;
+			} else if (!strcmp(item->name, AGENT_GUIDER_STATS_DITHERING_ITEM_NAME)) {
+				CLIENT_PRIVATE_DATA->guider_dithering = item->number.value;
+			}
+		}
+	} else if (!strcmp(property->name, AGENT_START_PROCESS_PROPERTY_NAME)) {
+		CLIENT_PRIVATE_DATA->guider_start_state = property->state;
+	} else if (!strcmp(property->name, AGENT_GUIDER_DITHER_PROPERTY_NAME)) {
+		CLIENT_PRIVATE_DATA->guider_dither_state = property->state;
+	} else if (!strcmp(property->name, AGENT_GUIDER_TARGET_OFFSET_PROPERTY_NAME)) {
+		for (int i = 0; i < property->count; i++) {
+			indigo_item *item = property->items + i;
+			if (!strcmp(item->name, AGENT_GUIDER_TARGET_OFFSET_RA_ITEM_NAME)) {
+				CLIENT_PRIVATE_DATA->guider_target_ra = item->number.value;
+			} else if (!strcmp(item->name, AGENT_GUIDER_TARGET_OFFSET_DEC_ITEM_NAME)) {
+				CLIENT_PRIVATE_DATA->guider_target_dec = item->number.value;
+			}
+		}
+	}
+}
+
+// the properties of the selected devices come from the agent itself, with the names it publishes
+static void snoop_changes(indigo_client *client, indigo_device *device, indigo_property *property) {
+	if (!strcmp(property->name, AO_GUIDE_RA_PROPERTY_NAME)) {
+		CLIENT_PRIVATE_DATA->ao_ra_state = property->state;
+		CLIENT_PRIVATE_DATA->ao_ra_serial++;
+	} else if (!strcmp(property->name, AO_GUIDE_DEC_PROPERTY_NAME)) {
+		CLIENT_PRIVATE_DATA->ao_dec_state = property->state;
+		CLIENT_PRIVATE_DATA->ao_dec_serial++;
+	} else if (!strcmp(property->name, GUIDER_GUIDE_RA_PROPERTY_NAME)) {
+		CLIENT_PRIVATE_DATA->guide_ra_state = property->state;
+		CLIENT_PRIVATE_DATA->guide_ra_serial++;
+	} else if (!strcmp(property->name, GUIDER_GUIDE_DEC_PROPERTY_NAME)) {
+		CLIENT_PRIVATE_DATA->guide_dec_state = property->state;
+		CLIENT_PRIVATE_DATA->guide_dec_serial++;
+	} else if (!strcmp(property->name, CCD_STREAMING_PROPERTY_NAME)) {
+		CLIENT_PRIVATE_DATA->has_streaming = true;
+		CLIENT_PRIVATE_DATA->streaming_state = property->state;
+	} else if (!strcmp(property->name, CCD_EXPOSURE_PROPERTY_NAME)) {
+		CLIENT_PRIVATE_DATA->exposure_state = property->state;
+	} else if (!strcmp(property->name, MOUNT_EQUATORIAL_COORDINATES_PROPERTY_NAME)) {
+		CLIENT_PRIVATE_DATA->mount_slewing = property->state == INDIGO_BUSY_STATE;
+		for (int i = 0; i < property->count; i++) {
+			if (!strcmp(property->items[i].name, MOUNT_EQUATORIAL_COORDINATES_DEC_ITEM_NAME)) {
+				CLIENT_PRIVATE_DATA->mount_dec = property->items[i].number.value;
+			}
+		}
+	} else if (!strcmp(property->name, MOUNT_SIDE_OF_PIER_PROPERTY_NAME)) {
+		for (int i = 0; i < property->count; i++) {
+			indigo_item *item = property->items + i;
+			if (!strcmp(item->name, MOUNT_SIDE_OF_PIER_WEST_ITEM_NAME) && item->sw.value) {
+				CLIENT_PRIVATE_DATA->mount_sop = 1;
+			} else if (!strcmp(item->name, MOUNT_SIDE_OF_PIER_EAST_ITEM_NAME) && item->sw.value) {
+				CLIENT_PRIVATE_DATA->mount_sop = -1;
+			}
+		}
+	}
+}
+
+// the driver name of the AO tells how it is positioned: the SBIG AO is absolute, the others relative
+static void snoop_info(indigo_client *client, indigo_property *property) {
+	indigo_device *device = FILTER_CLIENT_CONTEXT->device;
+	for (int i = 0; i < property->count; i++) {
+		indigo_item *item = property->items + i;
+		if (!strcmp(item->name, INFO_DEVICE_DRIVER_ITEM_NAME) && strstr(item->text.value, "sbig") != NULL) {
+			if (!AGENT_AO_MODE_ABSOLUTE_ITEM->sw.value && !FILTER_CLIENT_CONTEXT->running_process) {
+				indigo_set_switch(AGENT_AO_MODE_PROPERTY, AGENT_AO_MODE_ABSOLUTE_ITEM, true);
+				SET(S_RANGE) = 100;
+				SET(S_MAX_STEP) = 100;
+				indigo_update_property(device, AGENT_AO_MODE_PROPERTY, "SBIG AO detected, absolute positioning");
+				indigo_update_property(device, AGENT_AO_SETTINGS_PROPERTY, NULL);
+			}
+		}
+	}
+}
+
+// -------------------------------------------------------------------------------- INDIGO agent device implementation
+
+static bool validate_related_agent(indigo_device *device, indigo_property *info_property, int mask) {
+	return !strncmp(info_property->device, GUIDER_AGENT_PREFIX, strlen(GUIDER_AGENT_PREFIX));
+}
+
+static indigo_result agent_enumerate_properties(indigo_device *device, indigo_client *client, indigo_property *property);
+
+static indigo_property *init_numbers(indigo_device *device, const char *name, const char *label, indigo_property_perm perm, const setting_definition *definitions, int count) {
+	indigo_property *result = indigo_init_number_property(NULL, device->name, name, "Agent", label, INDIGO_OK_STATE, perm, count);
+	if (result == NULL) {
+		return NULL;
+	}
+	for (int i = 0; i < count; i++) {
+		indigo_init_number_item(result->items + i, definitions[i].name, definitions[i].label, definitions[i].min, definitions[i].max, definitions[i].step, definitions[i].value);
+	}
+	return result;
+}
+
+static indigo_result agent_device_attach(indigo_device *device) {
+	assert(device != NULL);
+	assert(DEVICE_PRIVATE_DATA != NULL);
+	if (indigo_filter_device_attach(device, DRIVER_NAME, DRIVER_VERSION, INDIGO_INTERFACE_AO | INDIGO_INTERFACE_CCD | INDIGO_INTERFACE_GUIDER | INDIGO_INTERFACE_MOUNT) == INDIGO_OK) {
+		// -------------------------------------------------------------------------------- Device properties
+		FILTER_AO_LIST_PROPERTY->hidden = false;
+		FILTER_CCD_LIST_PROPERTY->hidden = false;
+		FILTER_GUIDER_LIST_PROPERTY->hidden = false;
+		FILTER_MOUNT_LIST_PROPERTY->hidden = false;
+		FILTER_DEVICE_CONTEXT->validate_related_agent = validate_related_agent;
+		FILTER_RELATED_AGENT_LIST_PROPERTY->hidden = false;
+		// -------------------------------------------------------------------------------- Process control
+		AGENT_START_PROCESS_PROPERTY = indigo_init_switch_property(NULL, device->name, AGENT_START_PROCESS_PROPERTY_NAME, "Agent", "Start process", INDIGO_OK_STATE, INDIGO_RW_PERM, INDIGO_ANY_OF_MANY_RULE, 5);
+		if (AGENT_START_PROCESS_PROPERTY == NULL) {
+			return INDIGO_FAILED;
+		}
+		indigo_init_switch_item(AGENT_AO_CALIBRATION_ITEM, AGENT_AO_CALIBRATION_ITEM_NAME, "Calibrate AO", false);
+		indigo_init_switch_item(AGENT_AO_BUMP_CALIBRATION_ITEM, AGENT_AO_BUMP_CALIBRATION_ITEM_NAME, "Calibrate OAG on the mount", false);
+		indigo_init_switch_item(AGENT_AO_EXERCISE_ITEM, AGENT_AO_EXERCISE_ITEM_NAME, "Exercise AO", false);
+		indigo_init_switch_item(AGENT_AO_CENTER_ITEM, AGENT_AO_CENTER_ITEM_NAME, "Center AO", false);
+		indigo_init_switch_item(AGENT_AO_TRACKING_ITEM, AGENT_AO_TRACKING_ITEM_NAME, "Start AO loop", false);
+		AGENT_ABORT_PROCESS_PROPERTY = indigo_init_switch_property(NULL, device->name, AGENT_ABORT_PROCESS_PROPERTY_NAME, "Agent", "Abort process", INDIGO_OK_STATE, INDIGO_RW_PERM, INDIGO_AT_MOST_ONE_RULE, 1);
+		if (AGENT_ABORT_PROCESS_PROPERTY == NULL) {
+			return INDIGO_FAILED;
+		}
+		indigo_init_switch_item(AGENT_ABORT_PROCESS_ITEM, AGENT_ABORT_PROCESS_ITEM_NAME, "Abort", false);
+		// -------------------------------------------------------------------------------- Modes
+		AGENT_AO_MODE_PROPERTY = indigo_init_switch_property(NULL, device->name, AGENT_AO_MODE_PROPERTY_NAME, "Agent", "AO positioning", INDIGO_OK_STATE, INDIGO_RW_PERM, INDIGO_ONE_OF_MANY_RULE, 2);
+		if (AGENT_AO_MODE_PROPERTY == NULL) {
+			return INDIGO_FAILED;
+		}
+		indigo_init_switch_item(AGENT_AO_MODE_RELATIVE_ITEM, AGENT_AO_MODE_RELATIVE_ITEM_NAME, "Relative steps", true);
+		indigo_init_switch_item(AGENT_AO_MODE_ABSOLUTE_ITEM, AGENT_AO_MODE_ABSOLUTE_ITEM_NAME, "Absolute percent", false);
+		AGENT_AO_BUMP_MODE_PROPERTY = indigo_init_switch_property(NULL, device->name, AGENT_AO_BUMP_MODE_PROPERTY_NAME, "Agent", "Mount bump", INDIGO_OK_STATE, INDIGO_RW_PERM, INDIGO_ONE_OF_MANY_RULE, 4);
+		if (AGENT_AO_BUMP_MODE_PROPERTY == NULL) {
+			return INDIGO_FAILED;
+		}
+		indigo_init_switch_item(AGENT_AO_BUMP_MODE_AUTO_ITEM, AGENT_AO_BUMP_MODE_AUTO_ITEM_NAME, "Automatic", true);
+		indigo_init_switch_item(AGENT_AO_BUMP_MODE_GUIDER_AGENT_ITEM, AGENT_AO_BUMP_MODE_GUIDER_AGENT_ITEM_NAME, "Through the Guider Agent", false);
+		indigo_init_switch_item(AGENT_AO_BUMP_MODE_DIRECT_ITEM, AGENT_AO_BUMP_MODE_DIRECT_ITEM_NAME, "Direct guide pulses", false);
+		indigo_init_switch_item(AGENT_AO_BUMP_MODE_OFF_ITEM, AGENT_AO_BUMP_MODE_OFF_ITEM_NAME, "Off", false);
+		AGENT_AO_DEC_MODE_PROPERTY = indigo_init_switch_property(NULL, device->name, AGENT_AO_DEC_MODE_PROPERTY_NAME, "Agent", "Dec bump mode", INDIGO_OK_STATE, INDIGO_RW_PERM, INDIGO_ONE_OF_MANY_RULE, 3);
+		if (AGENT_AO_DEC_MODE_PROPERTY == NULL) {
+			return INDIGO_FAILED;
+		}
+		indigo_init_switch_item(AGENT_AO_DEC_MODE_BOTH_ITEM, AGENT_AO_DEC_MODE_BOTH_ITEM_NAME, "North and south", true);
+		indigo_init_switch_item(AGENT_AO_DEC_MODE_NORTH_ITEM, AGENT_AO_DEC_MODE_NORTH_ITEM_NAME, "North only", false);
+		indigo_init_switch_item(AGENT_AO_DEC_MODE_SOUTH_ITEM, AGENT_AO_DEC_MODE_SOUTH_ITEM_NAME, "South only", false);
+		// -------------------------------------------------------------------------------- Settings and statistics
+		AGENT_AO_SETTINGS_PROPERTY = init_numbers(device, AGENT_AO_SETTINGS_PROPERTY_NAME, "Settings", INDIGO_RW_PERM, settings_definitions, S_COUNT);
+		AGENT_AO_STATS_PROPERTY = init_numbers(device, AGENT_AO_STATS_PROPERTY_NAME, "Statistics", INDIGO_RO_PERM, stats_definitions, T_COUNT);
+		if (AGENT_AO_SETTINGS_PROPERTY == NULL || AGENT_AO_STATS_PROPERTY == NULL) {
+			return INDIGO_FAILED;
+		}
+		// --------------------------------------------------------------------------------
+		DEVICE_PRIVATE_DATA->guider_phase = INDIGO_GUIDER_PHASE_IGNORE;
+		pthread_mutex_init(&DEVICE_PRIVATE_DATA->mutex, NULL);
+		pthread_mutex_init(&DEVICE_PRIVATE_DATA->frame_mutex, NULL);
+		CONFIG_PROPERTY->hidden = true;
+		PROFILE_PROPERTY->hidden = true;
+		CONNECTION_PROPERTY->hidden = true;
+		indigo_load_properties(device, false);
+		INDIGO_DEVICE_ATTACH_LOG(DRIVER_NAME, device->name);
+		return agent_enumerate_properties(device, NULL, NULL);
+	}
+	return INDIGO_FAILED;
+}
+
+static indigo_result agent_enumerate_properties(indigo_device *device, indigo_client *client, indigo_property *property) {
+	if (client != NULL && client == FILTER_DEVICE_CONTEXT->client) {
+		return INDIGO_OK;
+	}
+	INDIGO_DEFINE_MATCHING_PROPERTY(AGENT_START_PROCESS_PROPERTY);
+	INDIGO_DEFINE_MATCHING_PROPERTY(AGENT_ABORT_PROCESS_PROPERTY);
+	INDIGO_DEFINE_MATCHING_PROPERTY(AGENT_AO_MODE_PROPERTY);
+	INDIGO_DEFINE_MATCHING_PROPERTY(AGENT_AO_BUMP_MODE_PROPERTY);
+	INDIGO_DEFINE_MATCHING_PROPERTY(AGENT_AO_DEC_MODE_PROPERTY);
+	INDIGO_DEFINE_MATCHING_PROPERTY(AGENT_AO_SETTINGS_PROPERTY);
+	INDIGO_DEFINE_MATCHING_PROPERTY(AGENT_AO_STATS_PROPERTY);
+	return indigo_filter_enumerate_properties(device, client, property);
+}
+
+static void stop_process(indigo_device *device) {
+	AGENT_ABORT_PROCESS_PROPERTY->state = INDIGO_BUSY_STATE;
+	indigo_cancel_pending_handlers(device);
+	for (int i = 0; i < 5000 && FILTER_DEVICE_CONTEXT->running_process; i++) {
+		indigo_usleep(1000);
+	}
+	indigo_cancel_all_timers(device);
+}
+
+static void start_process(indigo_device *device, void (*process)(indigo_device *device)) {
+	AGENT_START_PROCESS_PROPERTY->state = INDIGO_BUSY_STATE;
+	indigo_update_property(device, AGENT_START_PROCESS_PROPERTY, NULL);
+	indigo_set_timer(device, 0, process, NULL);
+}
+
+static indigo_result agent_change_property(indigo_device *device, indigo_client *client, indigo_property *property) {
+	assert(device != NULL);
+	assert(DEVICE_CONTEXT != NULL);
+	assert(property != NULL);
+	if (indigo_property_match_changeable(AGENT_START_PROCESS_PROPERTY, property)) {
+// -------------------------------------------------------------------------------- AGENT_START_PROCESS
+		if (AGENT_START_PROCESS_PROPERTY->state == INDIGO_BUSY_STATE || FILTER_DEVICE_CONTEXT->running_process) {
+			indigo_send_message(device, BUSY_PROPERTY, "A process is running, abort it first");
+			return INDIGO_OK;
+		}
+		indigo_property_copy_values(AGENT_START_PROCESS_PROPERTY, property, false);
+		if (AGENT_AO_CALIBRATION_ITEM->sw.value) {
+			start_process(device, calibrate_process);
+		} else if (AGENT_AO_BUMP_CALIBRATION_ITEM->sw.value) {
+			start_process(device, bump_calibrate_process);
+		} else if (AGENT_AO_EXERCISE_ITEM->sw.value) {
+			start_process(device, exercise_process);
+		} else if (AGENT_AO_CENTER_ITEM->sw.value) {
+			start_process(device, center_process);
+		} else if (AGENT_AO_TRACKING_ITEM->sw.value) {
+			start_process(device, tracking_process);
+		} else {
+			AGENT_START_PROCESS_PROPERTY->state = INDIGO_OK_STATE;
+			indigo_update_property(device, AGENT_START_PROCESS_PROPERTY, NULL);
+		}
+		return INDIGO_OK;
+	} else if (indigo_property_match_changeable(AGENT_ABORT_PROCESS_PROPERTY, property)) {
+// -------------------------------------------------------------------------------- AGENT_ABORT_PROCESS
+		indigo_property_copy_values(AGENT_ABORT_PROCESS_PROPERTY, property, false);
+		if (AGENT_ABORT_PROCESS_ITEM->sw.value) {
+			AGENT_ABORT_PROCESS_ITEM->sw.value = false;
+			if (FILTER_DEVICE_CONTEXT->running_process) {
+				AGENT_ABORT_PROCESS_PROPERTY->state = INDIGO_BUSY_STATE;
+			} else {
+				AGENT_ABORT_PROCESS_PROPERTY->state = INDIGO_OK_STATE;
+			}
+		}
+		indigo_update_property(device, AGENT_ABORT_PROCESS_PROPERTY, NULL);
+		return INDIGO_OK;
+	} else if (indigo_property_match_changeable(AGENT_AO_MODE_PROPERTY, property)) {
+// -------------------------------------------------------------------------------- AGENT_AO_MODE
+		if (FILTER_DEVICE_CONTEXT->running_process) {
+			AGENT_AO_MODE_PROPERTY->state = INDIGO_ALERT_STATE;
+			indigo_update_property(device, AGENT_AO_MODE_PROPERTY, "The positioning cannot change while a process is running");
+			return INDIGO_OK;
+		}
+		indigo_property_copy_values(AGENT_AO_MODE_PROPERTY, property, false);
+		AGENT_AO_MODE_PROPERTY->state = INDIGO_OK_STATE;
+		indigo_update_property(device, AGENT_AO_MODE_PROPERTY, NULL);
+		save_config(device);
+		return INDIGO_OK;
+	} else if (indigo_property_match_changeable(AGENT_AO_BUMP_MODE_PROPERTY, property)) {
+// -------------------------------------------------------------------------------- AGENT_AO_BUMP_MODE
+		indigo_property_copy_values(AGENT_AO_BUMP_MODE_PROPERTY, property, false);
+		AGENT_AO_BUMP_MODE_PROPERTY->state = INDIGO_OK_STATE;
+		indigo_update_property(device, AGENT_AO_BUMP_MODE_PROPERTY, NULL);
+		save_config(device);
+		return INDIGO_OK;
+	} else if (indigo_property_match_changeable(AGENT_AO_DEC_MODE_PROPERTY, property)) {
+// -------------------------------------------------------------------------------- AGENT_AO_DEC_MODE
+		indigo_property_copy_values(AGENT_AO_DEC_MODE_PROPERTY, property, false);
+		AGENT_AO_DEC_MODE_PROPERTY->state = INDIGO_OK_STATE;
+		indigo_update_property(device, AGENT_AO_DEC_MODE_PROPERTY, NULL);
+		save_config(device);
+		return INDIGO_OK;
+	} else if (indigo_property_match_changeable(AGENT_AO_SETTINGS_PROPERTY, property)) {
+// -------------------------------------------------------------------------------- AGENT_AO_SETTINGS
+		indigo_property_copy_values(AGENT_AO_SETTINGS_PROPERTY, property, false);
+		AGENT_AO_SETTINGS_PROPERTY->state = INDIGO_OK_STATE;
+		indigo_update_property(device, AGENT_AO_SETTINGS_PROPERTY, NULL);
+		save_config(device);
+		return INDIGO_OK;
+	}
+	return indigo_filter_change_property(device, client, property);
+}
+
+static indigo_result agent_device_detach(indigo_device *device) {
+	assert(device != NULL);
+	stop_process(device);
+	save_config(device);
+	indigo_release_property(AGENT_START_PROCESS_PROPERTY);
+	indigo_release_property(AGENT_ABORT_PROCESS_PROPERTY);
+	indigo_release_property(AGENT_AO_MODE_PROPERTY);
+	indigo_release_property(AGENT_AO_BUMP_MODE_PROPERTY);
+	indigo_release_property(AGENT_AO_DEC_MODE_PROPERTY);
+	indigo_release_property(AGENT_AO_SETTINGS_PROPERTY);
+	indigo_release_property(AGENT_AO_STATS_PROPERTY);
+	indigo_delete_frame_digest(&DEVICE_PRIVATE_DATA->reference);
+	pthread_mutex_destroy(&DEVICE_PRIVATE_DATA->mutex);
+	pthread_mutex_destroy(&DEVICE_PRIVATE_DATA->frame_mutex);
+	indigo_safe_free(DEVICE_PRIVATE_DATA->frame_data);
+	indigo_safe_free(DEVICE_PRIVATE_DATA->work_data);
+	INDIGO_DEVICE_DETACH_LOG(DRIVER_NAME, device->name);
+	return indigo_filter_device_detach(device);
+}
+
+// -------------------------------------------------------------------------------- INDIGO agent client implementation
+
+// The image of the camera is copied at once, the processing is up to the worker
+static void snoop_image(indigo_client *client, indigo_property *property) {
+	if (property->state != INDIGO_OK_STATE || property->count < 1) {
+		return;
+	}
+	indigo_item *item = property->items;
+	pthread_mutex_lock(&CLIENT_PRIVATE_DATA->frame_mutex);
+	if (CLIENT_PRIVATE_DATA->frames_wanted) {
+		if (item->blob.value && item->blob.size > 0) {
+			if (item->blob.size > CLIENT_PRIVATE_DATA->frame_capacity) {
+				CLIENT_PRIVATE_DATA->frame_data = indigo_safe_realloc(CLIENT_PRIVATE_DATA->frame_data, item->blob.size);
+				CLIENT_PRIVATE_DATA->frame_capacity = item->blob.size;
+			}
+			memcpy(CLIENT_PRIVATE_DATA->frame_data, item->blob.value, item->blob.size);
+			CLIENT_PRIVATE_DATA->frame_size = item->blob.size;
+			CLIENT_PRIVATE_DATA->frame_url[0] = 0;
+		} else {
+			INDIGO_COPY_VALUE(CLIENT_PRIVATE_DATA->frame_url, item->blob.url);
+		}
+		CLIENT_PRIVATE_DATA->frame_serial++;
+	}
+	pthread_mutex_unlock(&CLIENT_PRIVATE_DATA->frame_mutex);
+}
+
+static indigo_result agent_define_property(indigo_client *client, indigo_device *device, indigo_property *property, const char *message) {
+	if (device == FILTER_CLIENT_CONTEXT->device) {
+		snoop_changes(client, device, property);
+	} else if (!strcmp(property->name, INFO_PROPERTY_NAME)) {
+		if (!strcmp(property->device, FILTER_CLIENT_CONTEXT->device_name[INDIGO_FILTER_AO_INDEX])) {
+			snoop_info(client, property);
+		}
+	} else {
+		snoop_guider_agent(client, property);
+	}
+	return indigo_filter_define_property(client, device, property, message);
+}
+
+static indigo_result agent_update_property(indigo_client *client, indigo_device *device, indigo_property *property, const char *message) {
+	if (device == FILTER_CLIENT_CONTEXT->device) {
+		if (!strcmp(property->name, CCD_IMAGE_PROPERTY_NAME)) {
+			snoop_image(client, property);
+		} else {
+			snoop_changes(client, device, property);
+		}
+	} else {
+		snoop_guider_agent(client, property);
+	}
+	return indigo_filter_update_property(client, device, property, message);
+}
+
+static indigo_result agent_delete_property(indigo_client *client, indigo_device *device, indigo_property *property, const char *message) {
+	if (device == FILTER_CLIENT_CONTEXT->device) {
+		if (!strcmp(property->name, CCD_STREAMING_PROPERTY_NAME) || *property->name == 0) {
+			CLIENT_PRIVATE_DATA->has_streaming = false;
+		}
+	}
+	return indigo_filter_delete_property(client, device, property, message);
+}
+
+// -------------------------------------------------------------------------------- Initialization
+
+static ao_agent_private_data *private_data = NULL;
+
+static indigo_device *agent_device = NULL;
+static indigo_client *agent_client = NULL;
+
+indigo_result indigo_agent_ao(indigo_driver_action action, indigo_driver_info *info) {
+	static indigo_device agent_device_template = INDIGO_DEVICE_INITIALIZER(
+		AO_AGENT_NAME,
+		agent_device_attach,
+		agent_enumerate_properties,
+		agent_change_property,
+		NULL,
+		agent_device_detach
+	);
+
+	static indigo_client agent_client_template = {
+		AO_AGENT_NAME, false, NULL, INDIGO_OK, INDIGO_VERSION_CURRENT, NULL,
+		indigo_filter_client_attach,
+		agent_define_property,
+		agent_update_property,
+		agent_delete_property,
+		NULL,
+		indigo_filter_client_detach
+	};
+
+	static indigo_driver_action last_action = INDIGO_DRIVER_SHUTDOWN;
+
+	SET_DRIVER_INFO(info, AO_AGENT_NAME, __FUNCTION__, DRIVER_VERSION, false, last_action);
+
+	if (action == last_action) {
+		return INDIGO_OK;
+	}
+
+	switch(action) {
+		case INDIGO_DRIVER_INIT:
+			last_action = action;
+			private_data = indigo_safe_malloc(sizeof(ao_agent_private_data));
+			agent_device = indigo_safe_malloc_copy(sizeof(indigo_device), &agent_device_template);
+			agent_device->private_data = private_data;
+			indigo_attach_device(agent_device);
+			agent_client = indigo_safe_malloc_copy(sizeof(indigo_client), &agent_client_template);
+			agent_client->client_context = agent_device->device_context;
+			indigo_attach_client(agent_client);
+			break;
+
+		case INDIGO_DRIVER_SHUTDOWN:
+			last_action = action;
+			if (agent_device != NULL) {
+				stop_process(agent_device);
+			}
+			if (agent_client != NULL) {
+				indigo_detach_client(agent_client);
+				free(agent_client);
+				agent_client = NULL;
+			}
+			if (agent_device != NULL) {
+				indigo_detach_device(agent_device);
+				free(agent_device);
+				agent_device = NULL;
+			}
+			if (private_data != NULL) {
+				free(private_data);
+				private_data = NULL;
+			}
+			break;
+
+		case INDIGO_DRIVER_INFO:
+			break;
+	}
+	return INDIGO_OK;
+}

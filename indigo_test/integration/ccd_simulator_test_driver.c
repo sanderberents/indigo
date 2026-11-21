@@ -35,6 +35,36 @@ static indigo_result sim_test_attach_device(indigo_device *device) {
 	return indigo_attach_device(device);
 }
 
+// The AO deflection of the simulator, in AO steps
+double sim_test_ao_offset(bool ra) {
+	indigo_device *device = sim_test_imager;
+	return ra ? PRIVATE_DATA->ao_ra_offset : PRIVATE_DATA->ao_dec_offset;
+}
+
+void sim_test_set_ao_offsets(double ra, double dec) {
+	indigo_device *device = sim_test_imager;
+	PRIVATE_DATA->ao_ra_offset = ra;
+	PRIVATE_DATA->ao_dec_offset = dec;
+}
+
+void sim_test_seed(double seed) {
+	sim_seed(sim_test_imager, seed);
+}
+
+// Sets an item of SIMULATION_SETUP, the property is defined by the guidescope camera but shared by all cameras
+bool sim_test_set_setup(const char *name, double value) {
+	indigo_device *device = sim_test_imager;
+	for (int i = 0; i < SIMULATION_SETUP_PROPERTY->count; i++) {
+		if (!strcmp(SIMULATION_SETUP_PROPERTY->items[i].name, name)) {
+			SIMULATION_SETUP_PROPERTY->items[i].number.value = SIMULATION_SETUP_PROPERTY->items[i].number.target = value;
+			// like the change handler of the property, search the stars again
+			PRIVATE_DATA->ra = PRIVATE_DATA->dec = 0;
+			return true;
+		}
+	}
+	return false;
+}
+
 indigo_device *sim_test_imager_device(void) {
 	return sim_test_imager;
 }

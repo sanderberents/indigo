@@ -143,7 +143,7 @@ class FakeServer:
 	def __init__(self, devices=None, failure=None):
 		self.process = mock.Mock()
 		self.process.poll.return_value = None
-		self.names = list(devices if devices is not None else list(leak.OPERATIONS) + ["GPS Simulator", "Polar Aligner Simulator", "PowerBox Simulator", "Weather Station Simulator", "SQM Simulator", "CCD Bahtinov Mask Simulator", "DSLR Simulator", "CCD File Simulator", "CCD Guider Simulator (AO)"])
+		self.names = list(devices if devices is not None else list(leak.OPERATIONS) + ["GPS Simulator", "Polar Aligner Simulator", "PowerBox Simulator", "Weather Station Simulator", "SQM Simulator", "CCD Bahtinov Mask Simulator", "DSLR Simulator", "CCD File Simulator", "CCD Guider Simulator (AO)", "CCD OAG Simulator"])
 		self.failure = failure
 		self.stopped = False
 		self.changes = []

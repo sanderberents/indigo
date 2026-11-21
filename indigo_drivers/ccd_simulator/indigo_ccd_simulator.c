@@ -44,6 +44,7 @@
 #include <indigo/indigo_ccd_driver.h>
 #include <indigo/indigo_ccd_driver.h>
 #include <indigo/indigo_ccd_driver.h>
+#include <indigo/indigo_ccd_driver.h>
 #include <indigo/indigo_wheel_driver.h>
 #include <indigo/indigo_focuser_driver.h>
 #include <indigo/indigo_guider_driver.h>
@@ -54,11 +55,12 @@
 
 #pragma mark - Common definitions
 
-#define DRIVER_VERSION       0x0300002E
+#define DRIVER_VERSION       0x0300002F
 #define DRIVER_NAME          "indigo_ccd_simulator"
 #define DRIVER_LABEL         "Camera Simulator"
 #define IMAGER_CCD_DEVICE_NAME "CCD Imager Simulator"
 #define GUIDER_CCD_DEVICE_NAME "CCD Guider Simulator"
+#define OAG_CCD_DEVICE_NAME  "CCD OAG Simulator"
 #define BAHTINOV_CCD_DEVICE_NAME "CCD Bahtinov Mask Simulator"
 #define DSLR_CCD_DEVICE_NAME "DSLR Simulator"
 #define FILE_CCD_DEVICE_NAME "CCD File Simulator"
@@ -77,6 +79,8 @@
 #define ECLIPSE              360
 #define TEMP_UPDATE          5.0
 #define DEFOCUS_BLUR_SCALE   15
+#define OAG_FRAME_WIDTH      256
+#define OAG_FRAME_HEIGHT     192
 
 //- define
 
@@ -119,6 +123,18 @@
 #define ALT_POLAR_ERROR_ITEM           (SIMULATION_SETUP_PROPERTY->items + 21)
 #define AZ_POLAR_ERROR_ITEM            (SIMULATION_SETUP_PROPERTY->items + 22)
 #define IMAGE_AGE_ITEM                 (SIMULATION_SETUP_PROPERTY->items + 23)
+#define GS_SEEING_RMS_ITEM             (SIMULATION_SETUP_PROPERTY->items + 24)
+#define GS_SEEING_FREQ_ITEM            (SIMULATION_SETUP_PROPERTY->items + 25)
+#define TT_RMS_ITEM                    (SIMULATION_SETUP_PROPERTY->items + 26)
+#define TT_FREQ_ITEM                   (SIMULATION_SETUP_PROPERTY->items + 27)
+#define FLEX_X_ITEM                    (SIMULATION_SETUP_PROPERTY->items + 28)
+#define FLEX_Y_ITEM                    (SIMULATION_SETUP_PROPERTY->items + 29)
+#define AO_SCALE_ITEM                  (SIMULATION_SETUP_PROPERTY->items + 30)
+#define AO_LIMIT_ITEM                  (SIMULATION_SETUP_PROPERTY->items + 31)
+#define AO_ABSOLUTE_ITEM               (SIMULATION_SETUP_PROPERTY->items + 32)
+#define AO_TARGET_ITEM                 (SIMULATION_SETUP_PROPERTY->items + 33)
+#define AO_MOVE_TIME_ITEM              (SIMULATION_SETUP_PROPERTY->items + 34)
+#define SEED_ITEM                      (SIMULATION_SETUP_PROPERTY->items + 35)
 
 #define SIMULATION_SETUP_PROPERTY_NAME "SIMULATION_SETUP"
 #define IMAGE_WIDTH_ITEM_NAME          "IMAGE_WIDTH"
@@ -145,6 +161,18 @@
 #define ALT_POLAR_ERROR_ITEM_NAME      "ALT_POLAR_ERROR"
 #define AZ_POLAR_ERROR_ITEM_NAME       "AZ_POLAR_ERROR"
 #define IMAGE_AGE_ITEM_NAME            "IMAGE_AGE"
+#define GS_SEEING_RMS_ITEM_NAME        "GS_SEEING_RMS"
+#define GS_SEEING_FREQ_ITEM_NAME       "GS_SEEING_FREQ"
+#define TT_RMS_ITEM_NAME               "TT_RMS"
+#define TT_FREQ_ITEM_NAME              "TT_FREQ"
+#define FLEX_X_ITEM_NAME               "FLEX_X"
+#define FLEX_Y_ITEM_NAME               "FLEX_Y"
+#define AO_SCALE_ITEM_NAME             "AO_SCALE"
+#define AO_LIMIT_ITEM_NAME             "AO_LIMIT"
+#define AO_ABSOLUTE_ITEM_NAME          "AO_ABSOLUTE"
+#define AO_TARGET_ITEM_NAME            "AO_TARGET"
+#define AO_MOVE_TIME_ITEM_NAME         "AO_MOVE_TIME"
+#define SEED_ITEM_NAME                 "SEED"
 
 #define BAHTINOV_SETTINGS_PROPERTY      (PRIVATE_DATA->bahtinov_settings_property)
 #define ROTATION_ITEM                   (BAHTINOV_SETTINGS_PROPERTY->items + 0)
@@ -256,9 +284,9 @@ typedef struct {
 	indigo_property *bayerpat_property;
 	indigo_property *focuser_setup_property;
 	//+ data
-	indigo_device *imager, *guider_camera, *bahtinov, *dslr, *file;
+	indigo_device *imager, *guider_camera, *oag_camera, *bahtinov, *dslr, *file;
 	char imager_image[FITS_HEADER_SIZE + 2 * IMAGER_WIDTH * IMAGER_HEIGHT + 2880];
-	char *guider_image;
+	char *guider_image, *oag_image;
 	char bahtinov_image[FITS_HEADER_SIZE + BAHTINOV_WIDTH * BAHTINOV_HEIGHT + 2880];
 	char dslr_image[FITS_HEADER_SIZE + 3 * DSLR_WIDTH * DSLR_HEIGHT + 2880];
 	char *file_image, *raw_file_image;
@@ -267,12 +295,21 @@ typedef struct {
 	int side_of_pier, star_count, star_a[GUIDER_MAX_STARS];
 	double star_x[GUIDER_MAX_STARS], star_y[GUIDER_MAX_STARS];
 	int hotpixel_x[GUIDER_MAX_HOTPIXELS + 1], hotpixel_y[GUIDER_MAX_HOTPIXELS + 1], eclipse;
-	double exposure_deadline[5], streaming_deadline[5];
-	bool exposure_active[5], streaming_active[5];
+	double exposure_deadline[6], streaming_deadline[6];
+	bool exposure_active[6], streaming_active[6];
 	double target_temperature, current_temperature;
 	int current_slot, target_position, current_position, backlash_in, backlash_out;
 	bool focuser_outward;
 	double ao_ra_offset, ao_dec_offset, guide_rate;
+	double ao_ra_pending, ao_dec_pending;
+	bool ao_ra_alert, ao_dec_alert;
+	// private random number generator, seeded by the SEED item, so that simulated noise is reproducible
+	uint64_t rng_state;
+	bool rng_ready;
+	// the periodic error and the differential flexure run on the monotonic clock
+	double pe_start, flex_start, flex_ref_ra, flex_ref_dec;
+	// seeing of the guidescope camera (index 0) and tip-tilt of the OAG (index 1)
+	double noise_time[2], noise_x[2], noise_y[2];
 	//- data
 } simulator_private_data;
 
@@ -284,6 +321,8 @@ static void imager_ccd_ccd_exposure_handler(indigo_device *device);
 static void imager_ccd_ccd_streaming_handler(indigo_device *device);
 static void guider_ccd_ccd_exposure_handler(indigo_device *device);
 static void guider_ccd_ccd_streaming_handler(indigo_device *device);
+static void oag_ccd_ccd_exposure_handler(indigo_device *device);
+static void oag_ccd_ccd_streaming_handler(indigo_device *device);
 static void bahtinov_ccd_ccd_exposure_handler(indigo_device *device);
 static void bahtinov_ccd_ccd_streaming_handler(indigo_device *device);
 static void dslr_ccd_ccd_exposure_handler(indigo_device *device);
@@ -309,7 +348,75 @@ static int ccd_index(indigo_device *device) {
 	if (device == PRIVATE_DATA->dslr) {
 		return 3;
 	}
+	if (device == PRIVATE_DATA->oag_camera) {
+		return 5;
+	}
 	return 4;
+}
+
+// The guidescope camera and the off-axis guide camera (OAG, behind the AO) both render the star field
+static bool is_tracking_camera(indigo_device *device) {
+	return device == PRIVATE_DATA->guider_camera || device == PRIVATE_DATA->oag_camera;
+}
+
+static char *frame_buffer(indigo_device *device) {
+	if (device == PRIVATE_DATA->guider_camera) {
+		return PRIVATE_DATA->guider_image;
+	}
+	if (device == PRIVATE_DATA->oag_camera) {
+		return PRIVATE_DATA->oag_image;
+	}
+	return PRIVATE_DATA->imager_image;
+}
+
+static uint64_t sim_next64(indigo_device *device) {
+	uint64_t z = (PRIVATE_DATA->rng_state += 0x9E3779B97F4A7C15ULL);
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+	return z ^ (z >> 31);
+}
+
+// A seed of 0 means a time based seed, any other value gives a reproducible sequence
+static void sim_seed(indigo_device *device, double seed) {
+	PRIVATE_DATA->rng_state = seed != 0 ? (uint64_t)seed : ((uint64_t)(indigo_monotonic_time() * 1e6) ^ ((uint64_t)time(NULL) * 2654435761ULL));
+	PRIVATE_DATA->rng_ready = true;
+}
+
+// Replacement of rand(): 31 random bits
+static int sim_rand(indigo_device *device) {
+	if (!PRIVATE_DATA->rng_ready) {
+		sim_seed(device, 0);
+	}
+	return (int)(sim_next64(device) >> 33);
+}
+
+static double sim_uniform(indigo_device *device) {
+	return sim_rand(device) / 2147483648.0;
+}
+
+// Standard normal deviate, the sum of 12 uniform deviates (Irwin-Hall)
+static double sim_gauss(indigo_device *device) {
+	double sum = 0;
+	for (int i = 0; i < 12; i++) {
+		sum += sim_uniform(device);
+	}
+	return sum - 6;
+}
+
+// One step of filtered noise: white for a zero frequency, otherwise a first order low-pass with the given corner frequency
+static double noise_step(indigo_device *device, double *state, double rms, double frequency, double dt) {
+	if (rms <= 0) {
+		*state = 0;
+		return 0;
+	}
+	double g = sim_gauss(device);
+	if (frequency <= 0 || dt <= 0) {
+		*state = rms * g;
+	} else {
+		double a = exp(-2.0 * M_PI * frequency * dt);
+		*state = a * *state + sqrt(1.0 - a * a) * rms * g;
+	}
+	return *state;
 }
 
 static int mags[] = { 760000, 305000, 122000, 49000, 20000, 7800, 3100, 1200, 500, 200, 80, 32, 13 };
@@ -335,7 +442,7 @@ static void follow_simulated_mount(indigo_device *device) {
 	LAT_ITEM->number.value = LAT_ITEM->number.target = mount.latitude;
 	LONG_ITEM->number.value = LONG_ITEM->number.target = mount.longitude;
 	EPOCH_ITEM->number.value = EPOCH_ITEM->number.target = epoch;
-	indigo_update_property(device, SIMULATION_SETUP_PROPERTY, NULL);
+	indigo_update_property(PRIVATE_DATA->guider_camera, SIMULATION_SETUP_PROPERTY, NULL);
 }
 
 static void search_stars(indigo_device *device) {
@@ -558,6 +665,63 @@ static void gauss_blur(uint16_t *scl, uint16_t *tcl, int w, int h, double r) {
 #define blur_image           gauss_blur
 #endif/* USE_DISK_BLUR */
 
+// Offset of the star field in the camera pixels: the mount (periodic error, offsets set up by guiding), the AO deflection,
+// differential flexure and the seeing. The guidescope camera does not see the AO, tip-tilt and flexure, which belong to the
+// off-axis guide camera behind the AO, unless AO_TARGET sends the AO deflection to the guidescope camera.
+static void compute_offsets(indigo_device *device, double *x_offset, double *y_offset) {
+	bool oag = device == PRIVATE_DATA->oag_camera;
+	double now = indigo_monotonic_time();
+	if (PRIVATE_DATA->pe_start == 0) {
+		PRIVATE_DATA->pe_start = now;
+	}
+	/* Continuous periodic error (no snap-back): a smooth, bipolar sine.
+	   PER_ERR_VAL is the amplitude (px) and PER_ERR_CYCLE the worm period
+	   in seconds (a cycle of 0 disables the periodic error). */
+	double pe_seconds = now - PRIVATE_DATA->pe_start;
+	double pe_cycle = PER_ERR_CYCLE_ITEM->number.target;
+	double ra_offset = (pe_cycle > 0 ? PER_ERR_VAL_ITEM->number.target * sin(2.0 * M_PI * pe_seconds / pe_cycle) : 0.0) + IMAGE_RA_OFFSET_ITEM->number.value;
+	// the offsets turn with the star field, which the west side of the pier turns by 180 degrees (see search_stars)
+	double guider_angle = M_PI * IMAGE_ROTATION_ANGLE_ITEM->number.target / 180.0 + (SIDE_OF_PIER_ITEM->number.value == 1 ? M_PI : 0);
+	double guider_sin = sin(guider_angle);
+	double guider_cos = cos(guider_angle);
+	double x = ra_offset * guider_cos + IMAGE_DEC_OFFSET_ITEM->number.value * guider_sin;
+	double y = -ra_offset * guider_sin + IMAGE_DEC_OFFSET_ITEM->number.value * guider_cos;
+	// AO deflection, in AO steps, one step moves the star AO_SCALE pixels along the AO axes turned by AO_ANGLE
+	bool ao_here = AO_TARGET_ITEM->number.value > 0.5 ? !oag : oag;
+	if (ao_here) {
+		double ao_sin = sin(M_PI * AO_ANGLE_ITEM->number.target / 180.0);
+		double ao_cos = cos(M_PI * AO_ANGLE_ITEM->number.target / 180.0);
+		double scale = AO_SCALE_ITEM->number.target;
+		x += (PRIVATE_DATA->ao_ra_offset * ao_cos - PRIVATE_DATA->ao_dec_offset * ao_sin) * scale;
+		y += (PRIVATE_DATA->ao_ra_offset * ao_sin + PRIVATE_DATA->ao_dec_offset * ao_cos) * scale;
+	}
+	// seeing of the guidescope camera, tip-tilt of the OAG, each with its own filtered noise
+	int n = oag ? 1 : 0;
+	double dt = PRIVATE_DATA->noise_time[n] > 0 ? now - PRIVATE_DATA->noise_time[n] : 0;
+	PRIVATE_DATA->noise_time[n] = now;
+	double rms = (oag ? TT_RMS_ITEM : GS_SEEING_RMS_ITEM)->number.target;
+	double frequency = (oag ? TT_FREQ_ITEM : GS_SEEING_FREQ_ITEM)->number.target;
+	x += noise_step(device, PRIVATE_DATA->noise_x + n, rms, frequency, dt);
+	y += noise_step(device, PRIVATE_DATA->noise_y + n, rms, frequency, dt);
+	// differential flexure of the OAG against the guidescope, it starts over after a slew
+	if (oag) {
+		double ra = RA_ITEM->number.value;
+		double dec = DEC_ITEM->number.value;
+		double slew = fabs(ra - PRIVATE_DATA->flex_ref_ra) * 15 * cos(M_PI * dec / 180.0);
+		if (PRIVATE_DATA->flex_start == 0 || slew > 0.1 || fabs(dec - PRIVATE_DATA->flex_ref_dec) > 0.1) {
+			PRIVATE_DATA->flex_start = now;
+			PRIVATE_DATA->flex_ref_ra = ra;
+			PRIVATE_DATA->flex_ref_dec = dec;
+		}
+		double minutes = (now - PRIVATE_DATA->flex_start) / 60.0;
+		x += FLEX_X_ITEM->number.target * minutes;
+		y += FLEX_Y_ITEM->number.target * minutes;
+	}
+	// baseline jitter, centered
+	*x_offset = x + sim_uniform(device) / 10.0 - 0.05;
+	*y_offset = y + sim_uniform(device) / 10.0 - 0.05;
+}
+
 static void create_frame(indigo_device *device) {
 	if (device == PRIVATE_DATA->dslr) {
 		unsigned char *raw = (unsigned char *)(PRIVATE_DATA->dslr_image + FITS_HEADER_SIZE);
@@ -565,7 +729,7 @@ static void create_frame(indigo_device *device) {
 		for (int i = 0; i < size; i++) {
 			int rgb = indigo_ccd_simulator_rgb_image[i];
 			if (rgb < 0xF0) {
-				raw[i] = rgb  + (rand() & 0x0F);
+				raw[i] = rgb  + (sim_rand(device) & 0x0F);
 			} else {
 				raw[i] = rgb;
 			}
@@ -652,7 +816,7 @@ static void create_frame(indigo_device *device) {
 		if (angle == 0) {
 			for (int y = 0; y < BAHTINOV_HEIGHT; y++) {
 				for (int x = 0; x < BAHTINOV_WIDTH; x++) {
-					target_pixels[y][x] = (source_pixels[y][x] & 0xFC) | (rand() & 0x03);
+					target_pixels[y][x] = (source_pixels[y][x] & 0xFC) | (sim_rand(device) & 0x03);
 				}
 			}
 		} else {
@@ -660,7 +824,7 @@ static void create_frame(indigo_device *device) {
 			int cy = BAHTINOV_HEIGHT / 2;
 			for (int j = 0; j < BAHTINOV_WIDTH; j++) {
 				for (int i = 0; i < BAHTINOV_HEIGHT; i++) {
-					target_pixels[j][i] = rand() & 0x03;
+					target_pixels[j][i] = sim_rand(device) & 0x03;
 				}
 			}
 			double c = cos(angle);
@@ -670,7 +834,7 @@ static void create_frame(indigo_device *device) {
 					int src_x = (int)((x - cx) * c + (y - cy) * s + cx);
 					int src_y = (int)(-(x - cx) * s + (y - cy) * c + cy);
 					if (src_x >= 0 && src_x < BAHTINOV_WIDTH && src_y >= 0 && src_y < BAHTINOV_HEIGHT) {
-						target_pixels[y][x] = (source_pixels[src_y][src_x] & 0xFC) | (rand() & 0x03);
+						target_pixels[y][x] = (source_pixels[src_y][src_x] & 0xFC) | (sim_rand(device) & 0x03);
 					}
 				}
 			}
@@ -679,7 +843,7 @@ static void create_frame(indigo_device *device) {
 			indigo_process_image(device, PRIVATE_DATA->bahtinov_image, BAHTINOV_WIDTH, BAHTINOV_HEIGHT, 8, true, true, NULL, CCD_STREAMING_PROPERTY->state == INDIGO_BUSY_STATE);
 		}
 	} else {
-	uint16_t *raw = (uint16_t *)((device == PRIVATE_DATA->guider_camera ? PRIVATE_DATA->guider_image : PRIVATE_DATA->imager_image) + FITS_HEADER_SIZE);
+	uint16_t *raw = (uint16_t *)(frame_buffer(device) + FITS_HEADER_SIZE);
 		int horizontal_bin = (int)CCD_BIN_HORIZONTAL_ITEM->number.value;
 		int vertical_bin = (int)CCD_BIN_VERTICAL_ITEM->number.value;
 		int frame_left = (int)CCD_FRAME_LEFT_ITEM->number.value / horizontal_bin;
@@ -707,7 +871,7 @@ static void create_frame(indigo_device *device) {
 					raw[j * frame_width + i] = (uint16_t)(sum / (horizontal_bin * vertical_bin));
 				}
 			}
-		} else if (device == PRIVATE_DATA->guider_camera) {
+		} else if (is_tracking_camera(device)) {
 			for (int j = 0; j < frame_height; j++) {
 				int jj = j * j;
 				for (int i = 0; i < frame_width; i++) {
@@ -716,29 +880,13 @@ static void create_frame(indigo_device *device) {
 			}
 		} else {
 			for (int i = 0; i < size; i++) {
-				raw[i] = (rand() & 0x7F);
+				raw[i] = (sim_rand(device) & 0x7F);
 			}
 		}
-		if (device == PRIVATE_DATA->guider_camera && light_frame) {
-			static time_t start_time = 0;
-			if (start_time == 0) {
-				start_time = time(NULL);
-			}
+		if (is_tracking_camera(device) && light_frame) {
 			search_stars(device);
-			/* Continuous periodic error (no snap-back): a smooth, bipolar sine.
-			   PER_ERR_VAL is the amplitude (px) and PER_ERR_CYCLE the worm period
-			   in seconds (a cycle of 0 disables the periodic error). */
-			double pe_seconds = (double)(time(NULL) - start_time);
-			double pe_cycle = PER_ERR_CYCLE_ITEM->number.target;
-			double ra_offset = (pe_cycle > 0 ? PER_ERR_VAL_ITEM->number.target * sin(2.0 * M_PI * pe_seconds / pe_cycle) : 0.0) + IMAGE_RA_OFFSET_ITEM->number.value;
-			// the offsets turn with the star field, which the west side of the pier turns by 180 degrees (see search_stars)
-			double guider_angle = M_PI * IMAGE_ROTATION_ANGLE_ITEM->number.target / 180.0 + (SIDE_OF_PIER_ITEM->number.value == 1 ? M_PI : 0);
-			double guider_sin = sin(guider_angle);
-			double guider_cos = cos(guider_angle);
-			double ao_sin = sin(M_PI * AO_ANGLE_ITEM->number.target / 180.0);
-			double ao_cos = cos(M_PI * AO_ANGLE_ITEM->number.target / 180.0);
-			double x_offset = ra_offset * guider_cos + IMAGE_DEC_OFFSET_ITEM->number.value * guider_sin + PRIVATE_DATA->ao_ra_offset * ao_cos - PRIVATE_DATA->ao_dec_offset * ao_sin + (rand() / (double)RAND_MAX)/10.0 - 0.1;
-			double y_offset = -ra_offset * guider_sin + IMAGE_DEC_OFFSET_ITEM->number.value * guider_cos + PRIVATE_DATA->ao_ra_offset * ao_sin + PRIVATE_DATA->ao_dec_offset * ao_cos + (rand() / (double)RAND_MAX)/10.0 - 0.1;
+			double x_offset, y_offset;
+			compute_offsets(device, &x_offset, &y_offset);
 			bool y_flip = FLIPPED_STARS_ITEM->sw.value;
 			if (STARS_ITEM->sw.value || y_flip) {
 				for (int i = 0; i < PRIVATE_DATA->star_count; i++) {
@@ -837,17 +985,17 @@ static void create_frame(indigo_device *device) {
 		int value;
 		if (device == PRIVATE_DATA->imager && light_frame) {
 			for (int i = 0; i < size; i++) {
-				value = raw[i] + (rand() & 0x7F);
+				value = raw[i] + (sim_rand(device) & 0x7F);
 				raw[i] = (value > 65535) ? 65535 : value;
 			}
-		} else if (device == PRIVATE_DATA->guider_camera) {
+		} else if (is_tracking_camera(device)) {
 			for (int i = 0; i < size; i++) {
-				value = raw[i] + (rand() % (int)IMAGE_NOISE_VAR_ITEM->number.target) + (int)IMAGE_NOISE_FIX_ITEM->number.target;
+				value = raw[i] + (sim_rand(device) % (int)IMAGE_NOISE_VAR_ITEM->number.target) + (int)IMAGE_NOISE_FIX_ITEM->number.target;
 				raw[i] = (value > 65535) ? 65535 : value;
 			}
 		} else {
 			for (int i = 0; i < size; i++) {
-				raw[i] = (rand() & 0x7F);
+				raw[i] = (sim_rand(device) & 0x7F);
 			}
 		}
 
@@ -882,7 +1030,7 @@ static void create_frame(indigo_device *device) {
 			indigo_update_property(device, CCD_FRAME_PROPERTY, NULL);
 		}
 		if (CCD_EXPOSURE_PROPERTY->state == INDIGO_BUSY_STATE || CCD_STREAMING_PROPERTY->state == INDIGO_BUSY_STATE) {
-		indigo_process_image(device, device == PRIVATE_DATA->guider_camera ? PRIVATE_DATA->guider_image : PRIVATE_DATA->imager_image, frame_width, frame_height, bpp, true, true, NULL, CCD_STREAMING_PROPERTY->state == INDIGO_BUSY_STATE);
+		indigo_process_image(device, frame_buffer(device), frame_width, frame_height, bpp, true, true, NULL, CCD_STREAMING_PROPERTY->state == INDIGO_BUSY_STATE);
 		}
 	}
 }
@@ -1021,7 +1169,7 @@ static void configure_ccd(indigo_device *device, int kind) {
 	CCD_STREAMING_EXPOSURE_ITEM->number.min = 0.001;
 	CCD_STREAMING_EXPOSURE_ITEM->number.max = 0.5;
 	CCD_STREAMING_SETTINGS_PROPERTY->hidden = false;
-	if (kind == 0 || kind == 1) {
+	if (kind == 0 || kind == 1 || kind == 5) {
 		int width = kind == 0 ? IMAGER_WIDTH : GUIDER_WIDTH;
 		int height = kind == 0 ? IMAGER_HEIGHT : GUIDER_HEIGHT;
 		CCD_INFO_WIDTH_ITEM->number.value = CCD_FRAME_WIDTH_ITEM->number.max = CCD_FRAME_LEFT_ITEM->number.max = CCD_FRAME_WIDTH_ITEM->number.value = width;
@@ -1049,8 +1197,8 @@ static void configure_ccd(indigo_device *device, int kind) {
 		CCD_LENS_APERTURE_ITEM->number.value = kind == 0 ? 4 : 2;
 		CCD_LENS_PROPERTY->state = INDIGO_OK_STATE;
 		for (int i = 0; i <= GUIDER_MAX_HOTPIXELS; i++) {
-			PRIVATE_DATA->hotpixel_x[i] = rand() % (width - 200) + 100;
-			PRIVATE_DATA->hotpixel_y[i] = rand() % (height - 200) + 100;
+			PRIVATE_DATA->hotpixel_x[i] = sim_rand(device) % (width - 200) + 100;
+			PRIVATE_DATA->hotpixel_y[i] = sim_rand(device) % (height - 200) + 100;
 		}
 		if (kind == 0) {
 			CCD_COOLER_PROPERTY->hidden = CCD_TEMPERATURE_PROPERTY->hidden = CCD_COOLER_POWER_PROPERTY->hidden = false;
@@ -1060,6 +1208,13 @@ static void configure_ccd(indigo_device *device, int kind) {
 			CCD_EGAIN_ITEM->number.value = 0.82;
 		} else {
 			CCD_COOLER_PROPERTY->hidden = CCD_COOLER_POWER_PROPERTY->hidden = CCD_TEMPERATURE_PROPERTY->hidden = true;
+		}
+		if (kind == 5) {
+			// the off-axis guide camera works on a small window around the centre of the field, which keeps 10 Hz streaming cheap
+			CCD_FRAME_WIDTH_ITEM->number.value = CCD_FRAME_WIDTH_ITEM->number.target = OAG_FRAME_WIDTH;
+			CCD_FRAME_HEIGHT_ITEM->number.value = CCD_FRAME_HEIGHT_ITEM->number.target = OAG_FRAME_HEIGHT;
+			CCD_FRAME_LEFT_ITEM->number.value = CCD_FRAME_LEFT_ITEM->number.target = (width - OAG_FRAME_WIDTH) / 2;
+			CCD_FRAME_TOP_ITEM->number.value = CCD_FRAME_TOP_ITEM->number.target = (height - OAG_FRAME_HEIGHT) / 2;
 		}
 	} else if (kind == 2) {
 		CCD_INFO_WIDTH_ITEM->number.value = CCD_FRAME_WIDTH_ITEM->number.max = CCD_FRAME_LEFT_ITEM->number.max = CCD_FRAME_WIDTH_ITEM->number.value = BAHTINOV_WIDTH;
@@ -1218,6 +1373,28 @@ static void guider_dec_finalizer(indigo_device *device) {
 }
 
 //- guider.code
+
+//+ ao.code
+
+// The AO deflection is in AO steps, limited by AO_LIMIT. A move takes AO_MOVE_TIME seconds, the stars shift when it ends.
+static void ao_ra_finalizer(indigo_device *device) {
+	PRIVATE_DATA->ao_ra_offset = PRIVATE_DATA->ao_ra_pending;
+	AO_GUIDE_EAST_ITEM->number.value = AO_GUIDE_WEST_ITEM->number.value = 0;
+	INDIGO_UPDATE_PROPERTY_STATE(AO_GUIDE_RA_PROPERTY, PRIVATE_DATA->ao_ra_alert ? INDIGO_ALERT_STATE : INDIGO_OK_STATE, NULL);
+}
+
+static void ao_dec_finalizer(indigo_device *device) {
+	PRIVATE_DATA->ao_dec_offset = PRIVATE_DATA->ao_dec_pending;
+	AO_GUIDE_NORTH_ITEM->number.value = AO_GUIDE_SOUTH_ITEM->number.value = 0;
+	INDIGO_UPDATE_PROPERTY_STATE(AO_GUIDE_DEC_PROPERTY, PRIVATE_DATA->ao_dec_alert ? INDIGO_ALERT_STATE : INDIGO_OK_STATE, NULL);
+}
+
+// A relative request moves by steps, an absolute one (like the SBIG AO-7) is a percent of the limit and no request centers the axis
+static double ao_target(indigo_device *device, double offset, double request) {
+	return AO_ABSOLUTE_ITEM->number.target > 0.5 ? request * AO_LIMIT_ITEM->number.target / 100.0 : offset + request;
+}
+
+//- ao.code
 
 #pragma mark - High level code (imager_ccd)
 // device_id: imager_ccd type: ccd
@@ -1479,6 +1656,7 @@ static void guider_ccd_ccd_bin_handler(indigo_device *device) {
 static void guider_ccd_simulation_setup_handler(indigo_device *device) {
 	SIMULATION_SETUP_PROPERTY->state = INDIGO_OK_STATE;
 	//+ guider_ccd.SIMULATION_SETUP.on_change
+	sim_seed(device, SEED_ITEM->number.target);
 	if (EPOCH_ITEM->number.target != 0 && EPOCH_ITEM->number.target != 2000) {
 		EPOCH_ITEM->number.value = EPOCH_ITEM->number.target = 2000;
 	}
@@ -1527,7 +1705,7 @@ static indigo_result guider_ccd_attach(indigo_device *device) {
 		indigo_init_switch_item(FLIPPED_STARS_ITEM, FLIPPED_STARS_ITEM_NAME, "Stars (flipped)", false);
 		indigo_init_switch_item(SUN_ITEM, SUN_ITEM_NAME, "Sun", false);
 		indigo_init_switch_item(ECLIPSE_ITEM, ECLIPSE_ITEM_NAME, "Eclipse", false);
-		SIMULATION_SETUP_PROPERTY = indigo_init_number_property(NULL, device->name, SIMULATION_SETUP_PROPERTY_NAME, MAIN_GROUP, "Simulation Setup", INDIGO_OK_STATE, INDIGO_RW_PERM, 24);
+		SIMULATION_SETUP_PROPERTY = indigo_init_number_property(NULL, device->name, SIMULATION_SETUP_PROPERTY_NAME, MAIN_GROUP, "Simulation Setup", INDIGO_OK_STATE, INDIGO_RW_PERM, 36);
 		if (SIMULATION_SETUP_PROPERTY == NULL) {
 			return INDIGO_FAILED;
 		}
@@ -1555,6 +1733,18 @@ static indigo_result guider_ccd_attach(indigo_device *device) {
 		indigo_init_number_item(ALT_POLAR_ERROR_ITEM, ALT_POLAR_ERROR_ITEM_NAME, "Altitude polar error", -30, 30, 0, 0);
 		indigo_init_number_item(AZ_POLAR_ERROR_ITEM, AZ_POLAR_ERROR_ITEM_NAME, "Azimuth polar error", -30, 30, 0, 0);
 		indigo_init_number_item(IMAGE_AGE_ITEM, IMAGE_AGE_ITEM_NAME, "Max image age (s)", 0, 3600, 0, 0.0166667);
+		indigo_init_number_item(GS_SEEING_RMS_ITEM, GS_SEEING_RMS_ITEM_NAME, "Guidescope seeing RMS (px)", 0, 10, 0, 0);
+		indigo_init_number_item(GS_SEEING_FREQ_ITEM, GS_SEEING_FREQ_ITEM_NAME, "Guidescope seeing frequency (Hz, 0 = white)", 0, 100, 0, 0);
+		indigo_init_number_item(TT_RMS_ITEM, TT_RMS_ITEM_NAME, "OAG tip-tilt RMS (px)", 0, 10, 0, 0);
+		indigo_init_number_item(TT_FREQ_ITEM, TT_FREQ_ITEM_NAME, "OAG tip-tilt frequency (Hz, 0 = white)", 0, 100, 0, 0);
+		indigo_init_number_item(FLEX_X_ITEM, FLEX_X_ITEM_NAME, "OAG flexure X (px/min)", -100, 100, 0, 0);
+		indigo_init_number_item(FLEX_Y_ITEM, FLEX_Y_ITEM_NAME, "OAG flexure Y (px/min)", -100, 100, 0, 0);
+		indigo_init_number_item(AO_SCALE_ITEM, AO_SCALE_ITEM_NAME, "AO scale (px/step)", 0.01, 100, 0, 1);
+		indigo_init_number_item(AO_LIMIT_ITEM, AO_LIMIT_ITEM_NAME, "AO limit (steps)", 1, 1000, 0, 100);
+		indigo_init_number_item(AO_ABSOLUTE_ITEM, AO_ABSOLUTE_ITEM_NAME, "AO absolute positioning (0 = relative steps, 1 = percent of limit)", 0, 1, 1, 0);
+		indigo_init_number_item(AO_TARGET_ITEM, AO_TARGET_ITEM_NAME, "AO acts on (0 = OAG, 1 = guidescope camera)", 0, 1, 1, 0);
+		indigo_init_number_item(AO_MOVE_TIME_ITEM, AO_MOVE_TIME_ITEM_NAME, "AO move time (s)", 0, 10, 0, 0);
+		indigo_init_number_item(SEED_ITEM, SEED_ITEM_NAME, "Noise seed (0 = random)", 0, 1000000000, 0, 0);
 		INDIGO_DEVICE_ATTACH_LOG(DRIVER_NAME, device->name);
 		return guider_ccd_enumerate_properties(device, NULL, NULL);
 	}
@@ -1615,6 +1805,134 @@ static indigo_result guider_ccd_detach(indigo_device *device) {
 	//- guider_ccd.on_detach
 	indigo_release_property(GUIDER_MODE_PROPERTY);
 	indigo_release_property(SIMULATION_SETUP_PROPERTY);
+	INDIGO_DEVICE_DETACH_LOG(DRIVER_NAME, device->name);
+	return indigo_ccd_detach(device);
+}
+
+#pragma mark - High level code (oag_ccd)
+// device_id: oag_ccd type: ccd
+
+static void oag_ccd_connection_handler(indigo_device *device) {
+	if (CONNECTION_CONNECTED_ITEM->sw.value) {
+		CONNECTION_PROPERTY->state = INDIGO_OK_STATE;
+		indigo_send_message(device, OK_PROPERTY, "Connected to %s", device->name);
+	} else {
+		indigo_cancel_pending_handlers(device);
+		//+ oag_ccd.on_disconnect
+		indigo_cancel_pending_handler(device, oag_ccd_ccd_exposure_handler);
+		indigo_cancel_pending_handler(device, oag_ccd_ccd_streaming_handler);
+		abort_acquisition(device);
+		//- oag_ccd.on_disconnect
+		// Cancelled change handlers must not leave properties BUSY: a new session starts in a clean state.
+		indigo_property *cancelled_properties[] = {
+			CCD_EXPOSURE_PROPERTY,
+			CCD_STREAMING_PROPERTY,
+			CCD_ABORT_EXPOSURE_PROPERTY,
+			CCD_BIN_PROPERTY,
+		};
+		for (unsigned i = 0; i < sizeof(cancelled_properties) / sizeof(cancelled_properties[0]); i++) {
+			if (cancelled_properties[i] != NULL && cancelled_properties[i]->state == INDIGO_BUSY_STATE) {
+				cancelled_properties[i]->state = INDIGO_OK_STATE;
+			}
+		}
+		indigo_send_message(device, OK_PROPERTY, "Disconnected from %s", device->name);
+		CONNECTION_PROPERTY->state = INDIGO_OK_STATE;
+	}
+	indigo_ccd_change_property(device, NULL, CONNECTION_PROPERTY);
+}
+
+static void oag_ccd_ccd_exposure_handler(indigo_device *device) {
+	//+ oag_ccd.CCD_EXPOSURE.on_change
+	indigo_use_shortest_exposure_if_bias(device);
+	start_exposure(device); // exposure_finalizer owns completion
+	//- oag_ccd.CCD_EXPOSURE.on_change
+}
+
+static void oag_ccd_ccd_streaming_handler(indigo_device *device) {
+	//+ oag_ccd.CCD_STREAMING.on_change
+	start_streaming(device); // streaming_finalizer owns completion
+	//- oag_ccd.CCD_STREAMING.on_change
+}
+
+static void oag_ccd_ccd_abort_exposure_handler(indigo_device *device) {
+	//+ oag_ccd.CCD_ABORT_EXPOSURE.on_change
+	indigo_cancel_pending_handler(device, oag_ccd_ccd_exposure_handler);
+	indigo_cancel_pending_handler(device, oag_ccd_ccd_streaming_handler);
+	abort_acquisition(device); // cancel exposure_finalizer and streaming_finalizer
+	//- oag_ccd.CCD_ABORT_EXPOSURE.on_change
+}
+
+static void oag_ccd_ccd_bin_handler(indigo_device *device) {
+	CCD_BIN_PROPERTY->state = INDIGO_OK_STATE;
+	//+ oag_ccd.CCD_BIN.on_change
+	int horizontal = (int)CCD_BIN_HORIZONTAL_ITEM->number.target;
+	int vertical = (int)CCD_BIN_VERTICAL_ITEM->number.target;
+	if ((horizontal == 1 || horizontal == 2 || horizontal == 4) && horizontal == vertical) {
+		CCD_BIN_HORIZONTAL_ITEM->number.value = horizontal;
+		CCD_BIN_VERTICAL_ITEM->number.value = vertical;
+	} else {
+		CCD_BIN_PROPERTY->state = INDIGO_ALERT_STATE;
+	}
+	//- oag_ccd.CCD_BIN.on_change
+	indigo_update_property(device, CCD_BIN_PROPERTY, NULL);
+}
+
+#pragma mark - Device API (oag_ccd)
+
+static indigo_result oag_ccd_enumerate_properties(indigo_device *device, indigo_client *client, indigo_property *property);
+
+static indigo_result oag_ccd_attach(indigo_device *device) {
+	if (indigo_ccd_attach(device, DRIVER_NAME, DRIVER_VERSION) == INDIGO_OK) {
+		//+ oag_ccd.on_attach
+		PRIVATE_DATA->oag_camera = device;
+		configure_ccd(device, 5);
+		PRIVATE_DATA->oag_image = indigo_alloc_blob_buffer(FITS_HEADER_SIZE + 2 * GUIDER_WIDTH * GUIDER_HEIGHT + 2880);
+		//- oag_ccd.on_attach
+		CCD_EXPOSURE_PROPERTY->hidden = false;
+		CCD_STREAMING_PROPERTY->hidden = false;
+		CCD_ABORT_EXPOSURE_PROPERTY->hidden = false;
+		CCD_BIN_PROPERTY->hidden = false;
+		INDIGO_DEVICE_ATTACH_LOG(DRIVER_NAME, device->name);
+		return oag_ccd_enumerate_properties(device, NULL, NULL);
+	}
+	return INDIGO_FAILED;
+}
+
+static indigo_result oag_ccd_enumerate_properties(indigo_device *device, indigo_client *client, indigo_property *property) {
+	return indigo_ccd_enumerate_properties(device, client, property);
+}
+
+static indigo_result oag_ccd_change_property(indigo_device *device, indigo_client *client, indigo_property *property) {
+	if (indigo_property_match_changeable(CONNECTION_PROPERTY, property)) {
+		INDIGO_PROCESS_CONNECT(oag_ccd_connection_handler);
+		return INDIGO_OK;
+	} else if (indigo_property_match_changeable(CCD_EXPOSURE_PROPERTY, property)) {
+		INDIGO_REJECT_CHANGE_IF(CCD_STREAMING_PROPERTY->state == INDIGO_BUSY_STATE, CCD_EXPOSURE_PROPERTY, "Streaming in progress, an exposure can not be started");
+		INDIGO_COPY_VALUES_PROCESS_CHANGE(CCD_EXPOSURE_PROPERTY, oag_ccd_ccd_exposure_handler);
+		return INDIGO_OK;
+	} else if (indigo_property_match_changeable(CCD_STREAMING_PROPERTY, property)) {
+		INDIGO_REJECT_CHANGE_IF(CCD_EXPOSURE_PROPERTY->state == INDIGO_BUSY_STATE, CCD_STREAMING_PROPERTY, "Exposure in progress, streaming can not be started");
+		INDIGO_COPY_VALUES_PROCESS_CHANGE(CCD_STREAMING_PROPERTY, oag_ccd_ccd_streaming_handler);
+		return INDIGO_OK;
+	} else if (indigo_property_match_changeable(CCD_ABORT_EXPOSURE_PROPERTY, property)) {
+		INDIGO_COPY_VALUES_PROCESS_URGENT_CHANGE(CCD_ABORT_EXPOSURE_PROPERTY, oag_ccd_ccd_abort_exposure_handler);
+		return INDIGO_OK;
+	} else if (indigo_property_match_changeable(CCD_BIN_PROPERTY, property)) {
+		INDIGO_COPY_TARGETS_PROCESS_CHANGE(CCD_BIN_PROPERTY, oag_ccd_ccd_bin_handler);
+		return INDIGO_OK;
+	}
+	return indigo_ccd_change_property(device, client, property);
+}
+
+static indigo_result oag_ccd_detach(indigo_device *device) {
+	if (IS_CONNECTED) {
+		indigo_set_switch(CONNECTION_PROPERTY, CONNECTION_DISCONNECTED_ITEM, true);
+		oag_ccd_connection_handler(device);
+	}
+	//+ oag_ccd.on_detach
+	indigo_safe_free(PRIVATE_DATA->oag_image);
+	PRIVATE_DATA->oag_image = NULL;
+	//- oag_ccd.on_detach
 	INDIGO_DEVICE_DETACH_LOG(DRIVER_NAME, device->name);
 	return indigo_ccd_detach(device);
 }
@@ -2490,40 +2808,39 @@ static void ao_connection_handler(indigo_device *device) {
 }
 
 static void ao_guide_ra_handler(indigo_device *device) {
-	AO_GUIDE_RA_PROPERTY->state = INDIGO_OK_STATE;
 	//+ ao.AO_GUIDE_RA.on_change
-	PRIVATE_DATA->ao_ra_offset += AO_GUIDE_EAST_ITEM->number.value - AO_GUIDE_WEST_ITEM->number.value;
-	AO_GUIDE_EAST_ITEM->number.value = AO_GUIDE_WEST_ITEM->number.value = 0;
-	if (fabs(PRIVATE_DATA->ao_ra_offset) > 100) {
-		PRIVATE_DATA->ao_ra_offset = copysign(100, PRIVATE_DATA->ao_ra_offset);
-		AO_GUIDE_RA_PROPERTY->state = INDIGO_ALERT_STATE;
-	}
+	double limit = AO_LIMIT_ITEM->number.target;
+	double target = ao_target(device, PRIVATE_DATA->ao_ra_offset, AO_GUIDE_EAST_ITEM->number.value - AO_GUIDE_WEST_ITEM->number.value);
+	PRIVATE_DATA->ao_ra_alert = fabs(target) > limit;
+	PRIVATE_DATA->ao_ra_pending = PRIVATE_DATA->ao_ra_alert ? copysign(limit, target) : target;
+	indigo_execute_handler_in(device, AO_MOVE_TIME_ITEM->number.target, ao_ra_finalizer);
 	//- ao.AO_GUIDE_RA.on_change
-	indigo_update_property(device, AO_GUIDE_RA_PROPERTY, NULL);
 }
 
 static void ao_guide_dec_handler(indigo_device *device) {
-	AO_GUIDE_DEC_PROPERTY->state = INDIGO_OK_STATE;
 	//+ ao.AO_GUIDE_DEC.on_change
-	PRIVATE_DATA->ao_dec_offset += AO_GUIDE_NORTH_ITEM->number.value - AO_GUIDE_SOUTH_ITEM->number.value;
-	AO_GUIDE_NORTH_ITEM->number.value = AO_GUIDE_SOUTH_ITEM->number.value = 0;
-	if (fabs(PRIVATE_DATA->ao_dec_offset) > 100) {
-		PRIVATE_DATA->ao_dec_offset = copysign(100, PRIVATE_DATA->ao_dec_offset);
-		AO_GUIDE_DEC_PROPERTY->state = INDIGO_ALERT_STATE;
-	}
+	double limit = AO_LIMIT_ITEM->number.target;
+	double target = ao_target(device, PRIVATE_DATA->ao_dec_offset, AO_GUIDE_NORTH_ITEM->number.value - AO_GUIDE_SOUTH_ITEM->number.value);
+	PRIVATE_DATA->ao_dec_alert = fabs(target) > limit;
+	PRIVATE_DATA->ao_dec_pending = PRIVATE_DATA->ao_dec_alert ? copysign(limit, target) : target;
+	indigo_execute_handler_in(device, AO_MOVE_TIME_ITEM->number.target, ao_dec_finalizer);
 	//- ao.AO_GUIDE_DEC.on_change
-	indigo_update_property(device, AO_GUIDE_DEC_PROPERTY, NULL);
 }
 
 static void ao_reset_handler(indigo_device *device) {
-	AO_RESET_PROPERTY->state = INDIGO_OK_STATE;
 	//+ ao.AO_RESET.on_change
 	if (AO_CENTER_ITEM->sw.value) {
+		// centering ends a move in progress
+		indigo_cancel_pending_handler(device, ao_ra_finalizer);
+		indigo_cancel_pending_handler(device, ao_dec_finalizer);
 		PRIVATE_DATA->ao_ra_offset = PRIVATE_DATA->ao_dec_offset = 0;
+		AO_GUIDE_EAST_ITEM->number.value = AO_GUIDE_WEST_ITEM->number.value = AO_GUIDE_NORTH_ITEM->number.value = AO_GUIDE_SOUTH_ITEM->number.value = 0;
+		INDIGO_UPDATE_PROPERTY_STATE(AO_GUIDE_RA_PROPERTY, INDIGO_OK_STATE, NULL);
+		INDIGO_UPDATE_PROPERTY_STATE(AO_GUIDE_DEC_PROPERTY, INDIGO_OK_STATE, NULL);
 		AO_CENTER_ITEM->sw.value = false;
 	}
+	INDIGO_UPDATE_PROPERTY_STATE(AO_RESET_PROPERTY, INDIGO_OK_STATE, NULL);
 	//- ao.AO_RESET.on_change
-	indigo_update_property(device, AO_RESET_PROPERTY, NULL);
 }
 
 #pragma mark - Device API (ao)
@@ -2577,6 +2894,8 @@ static indigo_device imager_ccd_template = INDIGO_DEVICE_INITIALIZER(IMAGER_CCD_
 
 static indigo_device guider_ccd_template = INDIGO_DEVICE_INITIALIZER(GUIDER_CCD_DEVICE_NAME, guider_ccd_attach, guider_ccd_enumerate_properties, guider_ccd_change_property, NULL, guider_ccd_detach);
 
+static indigo_device oag_ccd_template = INDIGO_DEVICE_INITIALIZER(OAG_CCD_DEVICE_NAME, oag_ccd_attach, oag_ccd_enumerate_properties, oag_ccd_change_property, NULL, oag_ccd_detach);
+
 static indigo_device bahtinov_ccd_template = INDIGO_DEVICE_INITIALIZER(BAHTINOV_CCD_DEVICE_NAME, bahtinov_ccd_attach, bahtinov_ccd_enumerate_properties, bahtinov_ccd_change_property, NULL, bahtinov_ccd_detach);
 
 static indigo_device dslr_ccd_template = INDIGO_DEVICE_INITIALIZER(DSLR_CCD_DEVICE_NAME, dslr_ccd_attach, dslr_ccd_enumerate_properties, dslr_ccd_change_property, NULL, dslr_ccd_detach);
@@ -2598,6 +2917,7 @@ indigo_result indigo_ccd_simulator(indigo_driver_action action, indigo_driver_in
 	static simulator_private_data *private_data = NULL;
 	static indigo_device *imager_ccd = NULL;
 	static indigo_device *guider_ccd = NULL;
+	static indigo_device *oag_ccd = NULL;
 	static indigo_device *bahtinov_ccd = NULL;
 	static indigo_device *dslr_ccd = NULL;
 	static indigo_device *file_ccd = NULL;
@@ -2624,6 +2944,10 @@ indigo_result indigo_ccd_simulator(indigo_driver_action action, indigo_driver_in
 			guider_ccd->private_data = private_data;
 			guider_ccd->master_device = imager_ccd;
 			indigo_attach_device(guider_ccd);
+			oag_ccd = (indigo_device *)indigo_safe_malloc_copy(sizeof(indigo_device), &oag_ccd_template);
+			oag_ccd->private_data = private_data;
+			oag_ccd->master_device = imager_ccd;
+			indigo_attach_device(oag_ccd);
 			bahtinov_ccd = (indigo_device *)indigo_safe_malloc_copy(sizeof(indigo_device), &bahtinov_ccd_template);
 			bahtinov_ccd->private_data = private_data;
 			bahtinov_ccd->master_device = imager_ccd;
@@ -2658,6 +2982,7 @@ indigo_result indigo_ccd_simulator(indigo_driver_action action, indigo_driver_in
 		case INDIGO_DRIVER_SHUTDOWN: {
 			VERIFY_NOT_CONNECTED(imager_ccd);
 			VERIFY_NOT_CONNECTED(guider_ccd);
+			VERIFY_NOT_CONNECTED(oag_ccd);
 			VERIFY_NOT_CONNECTED(bahtinov_ccd);
 			VERIFY_NOT_CONNECTED(dslr_ccd);
 			VERIFY_NOT_CONNECTED(file_ccd);
@@ -2700,6 +3025,11 @@ indigo_result indigo_ccd_simulator(indigo_driver_action action, indigo_driver_in
 				indigo_detach_device(bahtinov_ccd);
 				indigo_safe_free(bahtinov_ccd);
 				bahtinov_ccd = NULL;
+			}
+			if (oag_ccd != NULL) {
+				indigo_detach_device(oag_ccd);
+				indigo_safe_free(oag_ccd);
+				oag_ccd = NULL;
 			}
 			if (guider_ccd != NULL) {
 				indigo_detach_device(guider_ccd);

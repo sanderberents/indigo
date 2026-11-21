@@ -5,6 +5,7 @@
 | Driver                  | API | Windows | Generator | Async Queues | Retested | Automated Tests (Sim / HW) | Comment |
 | ----------------------- | --- | ------- | --------- | ------------ | -------- | -------------------------- | ------- |
 | agent_alpaca            | 3️⃣ | ✅ Yes | ⛔ N/A | ✅ Yes | ✅ Yes | 4 / 0 | |
+| agent_ao                | 3️⃣ | ✅ Yes | ⛔ N/A | ✅ Yes | ❌ No  | 5 / 0 | |
 | agent_auxiliary         | 3️⃣ | ✅ Yes | ⛔ N/A | ✅ Yes | ✅ Yes | 0 / 0 | |
 | agent_config            | 3️⃣ | ✅ Yes | ⛔ N/A | ✅ Yes | ✅ Yes | 56 / 0 | |
 | agent_guider            | 3️⃣ | ✅ Yes | ⛔ N/A | ✅ Yes | ✅ Yes | 89 / 0 | |

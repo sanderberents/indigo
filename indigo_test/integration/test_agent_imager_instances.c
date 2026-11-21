@@ -451,7 +451,7 @@ static void cleanup(void) {
 		cleanup_check(result == INDIGO_OK, "imager shutdown");
 		imager_started = result != INDIGO_OK;
 	}
-	const char *devices[] = { GUIDER_OUTPUT, "CCD Guider Simulator (AO)", "CCD Imager Simulator (focuser)", "CCD Imager Simulator (wheel)", IMAGER_CAMERA, GUIDER_CAMERA, BAHTINOV_CAMERA, "DSLR Simulator", "CCD File Simulator" };
+	const char *devices[] = { GUIDER_OUTPUT, "CCD Guider Simulator (AO)", "CCD OAG Simulator", "CCD Imager Simulator (focuser)", "CCD Imager Simulator (wheel)", IMAGER_CAMERA, GUIDER_CAMERA, BAHTINOV_CAMERA, "DSLR Simulator", "CCD File Simulator" };
 	for (unsigned i = 0; i < ARRAY_SIZE(devices); i++) {
 		if (observer_attached && exists(devices[i], CONNECTION_PROPERTY_NAME) && (!switch_value(devices[i], CONNECTION_PROPERTY_NAME, CONNECTION_DISCONNECTED_ITEM_NAME) || state(devices[i], CONNECTION_PROPERTY_NAME) == INDIGO_BUSY_STATE)) {
 			cleanup_check(set_switch(devices[i], CONNECTION_PROPERTY_NAME, CONNECTION_DISCONNECTED_ITEM_NAME, true), devices[i]);

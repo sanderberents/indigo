@@ -43,7 +43,7 @@
 extern "C" {
 #endif
 
-#define INDIGO_FILTER_LIST_COUNT							13
+#define INDIGO_FILTER_LIST_COUNT							14
 #define INDIGO_FILTER_MAX_DEVICES							128
 #define INDIGO_FILTER_MAX_CACHED_PROPERTIES		256
 	
@@ -60,6 +60,7 @@ extern "C" {
 #define INDIGO_FILTER_AUX_2_INDEX							10
 #define INDIGO_FILTER_AUX_3_INDEX							11
 #define INDIGO_FILTER_AUX_4_INDEX							12
+#define INDIGO_FILTER_AO_INDEX								13
 
 /** Device context pointer.
  */
@@ -122,6 +123,10 @@ extern "C" {
 */
 #define FILTER_AUX_4_LIST_PROPERTY		(FILTER_DEVICE_CONTEXT->filter_device_list_properties[INDIGO_FILTER_AUX_4_INDEX])
 
+/** Active optics list switch property.
+*/
+#define FILTER_AO_LIST_PROPERTY		(FILTER_DEVICE_CONTEXT->filter_device_list_properties[INDIGO_FILTER_AO_INDEX])
+
 /** CCD list switch property.
  */
 #define FILTER_RELATED_CCD_LIST_PROPERTY		(FILTER_DEVICE_CONTEXT->filter_related_device_list_properties[INDIGO_FILTER_CCD_INDEX])
@@ -173,6 +178,10 @@ extern "C" {
 /** Related AUX #4 list switch property.
 */
 #define FILTER_RELATED_AUX_4_LIST_PROPERTY		(FILTER_DEVICE_CONTEXT->filter_related_device_list_properties[INDIGO_FILTER_AUX_4_INDEX])
+
+/** Related active optics list switch property.
+*/
+#define FILTER_RELATED_AO_LIST_PROPERTY		(FILTER_DEVICE_CONTEXT->filter_related_device_list_properties[INDIGO_FILTER_AO_INDEX])
 
 /** Related agent list switch property.
  */
@@ -253,6 +262,7 @@ typedef struct {
 #define INDIGO_FILTER_AUX_2_SELECTED 			(FILTER_AUX_2_LIST_PROPERTY->state == INDIGO_OK_STATE && !FILTER_AUX_2_LIST_PROPERTY->items->sw.value)
 #define INDIGO_FILTER_AUX_3_SELECTED 			(FILTER_AUX_3_LIST_PROPERTY->state == INDIGO_OK_STATE && !FILTER_AUX_3_LIST_PROPERTY->items->sw.value)
 #define INDIGO_FILTER_AUX_4_SELECTED 			(FILTER_AUX_4_LIST_PROPERTY->state == INDIGO_OK_STATE && !FILTER_AUX_4_LIST_PROPERTY->items->sw.value)
+#define INDIGO_FILTER_AO_SELECTED 				(FILTER_AO_LIST_PROPERTY->state == INDIGO_OK_STATE && !FILTER_AO_LIST_PROPERTY->items->sw.value)
 
 /** Device attach callback function.
  */

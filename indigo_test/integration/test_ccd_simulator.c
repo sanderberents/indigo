@@ -133,6 +133,22 @@ static const simulator_driver_case ccd_guider_camera_simulator = {
 	0
 };
 
+static const simulator_driver_case ccd_oag_simulator = {
+	"Camera Simulator",
+	"indigo_ccd_simulator",
+	"CCD OAG Simulator",
+	indigo_ccd_simulator,
+	true,
+	NULL,
+	0,
+	NULL,
+	0,
+	NULL,
+	0,
+	NULL,
+	0
+};
+
 static const simulator_driver_case ccd_guider_simulator = {
 	"Camera Simulator",
 	"indigo_ccd_simulator",
@@ -439,6 +455,10 @@ static void ccd_guider_camera_passes_compliance_checks(void) {
 	assert_ccd_camera_compliance(&ccd_guider_camera_simulator, true, extra_properties, ARRAY_SIZE(extra_properties));
 }
 
+static void ccd_oag_camera_passes_compliance_checks(void) {
+	assert_ccd_camera_compliance(&ccd_oag_simulator, true, NULL, 0);
+}
+
 static void ccd_bahtinov_camera_passes_compliance_checks(void) {
 	static const char *extra_properties[] = {
 		"BAHTINOV_SETTINGS"
@@ -538,6 +558,10 @@ static void ccd_ao_passes_compliance_checks(void) {
 indigo_device *sim_test_imager_device(void);
 void sim_test_prepare_hotpixel_edges(indigo_device *device);
 bool sim_test_hotpixel_guard_intact(indigo_device *device);
+double sim_test_ao_offset(bool ra);
+void sim_test_set_ao_offsets(double ra, double dec);
+bool sim_test_set_setup(const char *name, double value);
+void sim_test_seed(double seed);
 
 static bool sim_fast_temperature;
 static indigo_timer **sim_temperature_timer;
@@ -1461,6 +1485,187 @@ cleanup:
 	sim_follow_end();
 }
 
+// The off-axis guide camera works on a small window of the field, which keeps a 10 Hz stream cheap
+static void simulator_oag_camera_streams_a_small_frame(void) {
+	sim_begin(&ccd_oag_simulator);
+	int before;
+	SIM_CHECK(sim_expose());
+	SIM_CHECK(atomic_load(&sim_width) == 256 && atomic_load(&sim_height) == 192);
+	before = atomic_load(&sim_frames);
+	SIM_CHECK(sim_number("CCD_STREAMING", 2, (const char *[]){ "EXPOSURE", "COUNT" }, (double []){ 0.1, 5 }, INDIGO_OK_STATE));
+	SIM_CHECK(atomic_load(&sim_frames) == before + 5 && !atomic_load(&sim_bad_frames));
+cleanup:
+	sim_end(&ccd_oag_simulator);
+}
+
+// Stars only, AO axes turned by 30 degrees and 0.5 px per step, no periodic error and no noise terms
+static bool sim_oag_begin(void) {
+	sim_begin(&ccd_oag_simulator);
+	atomic_store(&sim_capture, true);
+	sim_test_set_ao_offsets(0, 0);
+	return sim_test_set_setup("IMAGE_ROTATION_ANGLE", FOLLOW_ROTATION) && sim_test_set_setup("PER_ERR_CYCLE", 0) && sim_test_set_setup("AO_ANGLE", 30) && sim_test_set_setup("AO_SCALE", 0.5) && sim_test_set_setup("AO_TARGET", 0) && sim_test_set_setup("TT_RMS", 0) && sim_test_set_setup("FLEX_X", 0) && sim_test_set_setup("FLEX_Y", 0);
+}
+
+static void sim_oag_end(void) {
+	atomic_store(&sim_capture, false);
+	free(sim_image);
+	sim_image = NULL;
+	sim_end(&ccd_oag_simulator);
+}
+
+// A deflection of the AO moves the star of the OAG by AO_SCALE pixels per step along the AO axes, and the guidescope camera does not see it
+static void simulator_ao_moves_the_oag_star_and_not_the_guidescope_star(void) {
+	double x0, y0, x1, y1;
+	double shift = 20 * 0.5;
+	SIM_CHECK(sim_oag_begin());
+	SIM_CHECK(sim_expose_centroid(&x0, &y0));
+	sim_test_set_ao_offsets(20, 0);
+	SIM_CHECK(sim_expose_centroid(&x1, &y1));
+	printf("    OAG: 20 AO steps shifted the star by %.3f, %.3f px\n", x1 - x0, y1 - y0);
+	SIM_CHECK(fabs(x1 - x0 - shift * cos(30 * M_PI / 180)) < 0.3 && fabs(y1 - y0 - shift * sin(30 * M_PI / 180)) < 0.3);
+	sim_test_set_ao_offsets(0, 20);
+	SIM_CHECK(sim_expose_centroid(&x1, &y1));
+	SIM_CHECK(fabs(x1 - x0 + shift * sin(30 * M_PI / 180)) < 0.3 && fabs(y1 - y0 - shift * cos(30 * M_PI / 180)) < 0.3);
+cleanup:
+	sim_test_set_ao_offsets(0, 0);
+	sim_oag_end();
+}
+
+// The guidescope camera does not see the AO, unless AO_TARGET sends the deflection to it, as the simulator did before the OAG
+static void simulator_ao_does_not_move_the_guidescope_star_unless_targeted(void) {
+	double x0, y0, x1, y1;
+	SIM_CHECK(sim_follow_begin());
+	SIM_CHECK(sim_test_set_setup("AO_TARGET", 0) && sim_test_set_setup("AO_SCALE", 0.5) && sim_test_set_setup("AO_ANGLE", 30));
+	sim_test_set_ao_offsets(0, 0);
+	SIM_CHECK(sim_expose_centroid(&x0, &y0));
+	sim_test_set_ao_offsets(20, 20);
+	SIM_CHECK(sim_expose_centroid(&x1, &y1));
+	printf("    guidescope camera: the same deflection shifted the star by %.3f, %.3f px\n", x1 - x0, y1 - y0);
+	SIM_CHECK(fabs(x1 - x0) < 0.3 && fabs(y1 - y0) < 0.3);
+	SIM_CHECK(sim_test_set_setup("AO_TARGET", 1));
+	SIM_CHECK(sim_expose_centroid(&x1, &y1));
+	SIM_CHECK(hypot(x1 - x0, y1 - y0) > 5);
+cleanup:
+	sim_test_set_ao_offsets(0, 0);
+	sim_test_set_setup("AO_TARGET", 0);
+	sim_follow_end();
+}
+
+// Seeded tip-tilt is reproducible and has the requested size, the flexure drifts the OAG and not the guidescope camera
+static void simulator_oag_noise_is_seeded_and_flexure_drifts(void) {
+	double x[40], y[40], rerun_x[40], rerun_y[40];
+	SIM_CHECK(sim_oag_begin());
+	SIM_CHECK(sim_test_set_setup("TT_RMS", 1.0));
+	for (int pass = 0; pass < 2; pass++) {
+		sim_test_seed(1234);
+		for (int i = 0; i < 40; i++) {
+			SIM_CHECK(sim_expose_centroid(pass ? rerun_x + i : x + i, pass ? rerun_y + i : y + i));
+		}
+	}
+	double mean_x = 0, mean_y = 0, variance = 0;
+	for (int i = 0; i < 40; i++) {
+		mean_x += x[i] / 40;
+		mean_y += y[i] / 40;
+	}
+	for (int i = 0; i < 40; i++) {
+		variance += ((x[i] - mean_x) * (x[i] - mean_x) + (y[i] - mean_y) * (y[i] - mean_y)) / 80;
+		// the same seed gives the same sequence of offsets, only the wall clock decides the filter step of a non-white noise
+		SIM_CHECK(fabs(x[i] - rerun_x[i]) < 0.3 && fabs(y[i] - rerun_y[i]) < 0.3);
+	}
+	printf("    OAG tip-tilt RMS of 1 px measured as %.2f px\n", sqrt(variance));
+	SIM_CHECK(sqrt(variance) > 0.5 && sqrt(variance) < 2.0);
+	// flexure of 60 px/min along X moves the star by 1 px per second, starting over after a slew
+	SIM_CHECK(sim_test_set_setup("TT_RMS", 0) && sim_test_set_setup("FLEX_X", 60));
+	double x0, y0, x1, y1;
+	SIM_CHECK(sim_expose_centroid(&x0, &y0));
+	indigo_usleep(1500000);
+	SIM_CHECK(sim_expose_centroid(&x1, &y1));
+	printf("    OAG flexure shifted the star by %.2f, %.2f px in 1.5 s\n", x1 - x0, y1 - y0);
+	SIM_CHECK(x1 - x0 > 1 && fabs(y1 - y0) < 0.3);
+cleanup:
+	sim_test_set_setup("TT_RMS", 0);
+	sim_test_set_setup("FLEX_X", 0);
+	sim_oag_end();
+}
+
+static bool ao_request(const char *property, const char *item, double value) {
+	unsigned revision = property_revision(property);
+	return indigo_change_number_property_1(&simulator_test_client, ccd_ao_simulator.device_name, property, item, value) == INDIGO_OK && wait_for_property_state_after(property, INDIGO_OK_STATE, revision);
+}
+
+// Relative requests accumulate steps up to AO_LIMIT, which raises ALERT and clamps; CENTER returns to zero
+static void simulator_ao_relative_moves_are_limited_and_centered(void) {
+	start_connected_simulator(&ccd_ao_simulator);
+	sim_test_set_setup("AO_ABSOLUTE", 0);
+	sim_test_set_setup("AO_LIMIT", 50);
+	sim_test_set_setup("AO_MOVE_TIME", 0);
+	sim_test_set_ao_offsets(0, 0);
+	ASSERT_TRUE(ao_request(AO_GUIDE_RA_PROPERTY_NAME, AO_GUIDE_EAST_ITEM_NAME, 30));
+	ASSERT_NEAR(30, sim_test_ao_offset(true), 1e-9);
+	ASSERT_TRUE(ao_request(AO_GUIDE_RA_PROPERTY_NAME, AO_GUIDE_WEST_ITEM_NAME, 10));
+	ASSERT_NEAR(20, sim_test_ao_offset(true), 1e-9);
+	ASSERT_TRUE(ao_request(AO_GUIDE_DEC_PROPERTY_NAME, AO_GUIDE_NORTH_ITEM_NAME, 40));
+	ASSERT_NEAR(40, sim_test_ao_offset(false), 1e-9);
+	{
+		unsigned revision = property_revision(AO_GUIDE_DEC_PROPERTY_NAME);
+		ASSERT_EQ_INT(INDIGO_OK, indigo_change_number_property_1(&simulator_test_client, ccd_ao_simulator.device_name, AO_GUIDE_DEC_PROPERTY_NAME, AO_GUIDE_NORTH_ITEM_NAME, 40));
+		ASSERT_TRUE(wait_for_property_state_after(AO_GUIDE_DEC_PROPERTY_NAME, INDIGO_ALERT_STATE, revision));
+		ASSERT_NEAR(50, sim_test_ao_offset(false), 1e-9);
+	}
+	ASSERT_EQ_INT(INDIGO_OK, indigo_change_switch_property_1(&simulator_test_client, ccd_ao_simulator.device_name, AO_RESET_PROPERTY_NAME, AO_CENTER_ITEM_NAME, true));
+	ASSERT_TRUE(wait_for_property_state(AO_RESET_PROPERTY_NAME, INDIGO_OK_STATE));
+	ASSERT_NEAR(0, sim_test_ao_offset(true), 1e-9);
+	ASSERT_NEAR(0, sim_test_ao_offset(false), 1e-9);
+	sim_test_set_setup("AO_LIMIT", 100);
+	stop_connected_simulator(&ccd_ao_simulator);
+}
+
+// An absolute request, like the one of the SBIG AO-7, is a percent of the limit and no request centers the axis
+static void simulator_ao_absolute_moves_are_percent_of_the_limit(void) {
+	start_connected_simulator(&ccd_ao_simulator);
+	sim_test_set_setup("AO_ABSOLUTE", 1);
+	sim_test_set_setup("AO_LIMIT", 80);
+	sim_test_set_setup("AO_MOVE_TIME", 0);
+	sim_test_set_ao_offsets(0, 0);
+	ASSERT_TRUE(ao_request(AO_GUIDE_RA_PROPERTY_NAME, AO_GUIDE_EAST_ITEM_NAME, 50));
+	ASSERT_NEAR(40, sim_test_ao_offset(true), 1e-9);
+	ASSERT_TRUE(ao_request(AO_GUIDE_RA_PROPERTY_NAME, AO_GUIDE_EAST_ITEM_NAME, 25));
+	ASSERT_NEAR(20, sim_test_ao_offset(true), 1e-9);
+	ASSERT_TRUE(ao_request(AO_GUIDE_RA_PROPERTY_NAME, AO_GUIDE_WEST_ITEM_NAME, 100));
+	ASSERT_NEAR(-80, sim_test_ao_offset(true), 1e-9);
+	ASSERT_TRUE(ao_request(AO_GUIDE_RA_PROPERTY_NAME, AO_GUIDE_EAST_ITEM_NAME, 0));
+	ASSERT_NEAR(0, sim_test_ao_offset(true), 1e-9);
+	sim_test_set_setup("AO_ABSOLUTE", 0);
+	sim_test_set_setup("AO_LIMIT", 100);
+	stop_connected_simulator(&ccd_ao_simulator);
+}
+
+// A move takes AO_MOVE_TIME: the property is BUSY and the deflection unchanged until it ends, CENTER ends it at once
+static void simulator_ao_move_time_keeps_the_property_busy(void) {
+	start_connected_simulator(&ccd_ao_simulator);
+	sim_test_set_setup("AO_ABSOLUTE", 0);
+	sim_test_set_setup("AO_LIMIT", 100);
+	sim_test_set_setup("AO_MOVE_TIME", 0.6);
+	sim_test_set_ao_offsets(0, 0);
+	unsigned revision = property_revision(AO_GUIDE_RA_PROPERTY_NAME);
+	ASSERT_EQ_INT(INDIGO_OK, indigo_change_number_property_1(&simulator_test_client, ccd_ao_simulator.device_name, AO_GUIDE_RA_PROPERTY_NAME, AO_GUIDE_EAST_ITEM_NAME, 10));
+	ASSERT_TRUE(wait_for_property_state_after(AO_GUIDE_RA_PROPERTY_NAME, INDIGO_BUSY_STATE, revision));
+	ASSERT_NEAR(0, sim_test_ao_offset(true), 1e-9);
+	ASSERT_TRUE(wait_for_property_state(AO_GUIDE_RA_PROPERTY_NAME, INDIGO_OK_STATE));
+	ASSERT_NEAR(10, sim_test_ao_offset(true), 1e-9);
+	revision = property_revision(AO_GUIDE_RA_PROPERTY_NAME);
+	ASSERT_EQ_INT(INDIGO_OK, indigo_change_number_property_1(&simulator_test_client, ccd_ao_simulator.device_name, AO_GUIDE_RA_PROPERTY_NAME, AO_GUIDE_EAST_ITEM_NAME, 10));
+	ASSERT_TRUE(wait_for_property_state_after(AO_GUIDE_RA_PROPERTY_NAME, INDIGO_BUSY_STATE, revision));
+	ASSERT_EQ_INT(INDIGO_OK, indigo_change_switch_property_1(&simulator_test_client, ccd_ao_simulator.device_name, AO_RESET_PROPERTY_NAME, AO_CENTER_ITEM_NAME, true));
+	ASSERT_TRUE(wait_for_property_state(AO_RESET_PROPERTY_NAME, INDIGO_OK_STATE));
+	ASSERT_TRUE(wait_for_property_state(AO_GUIDE_RA_PROPERTY_NAME, INDIGO_OK_STATE));
+	ASSERT_NEAR(0, sim_test_ao_offset(true), 1e-9);
+	indigo_usleep(800000);
+	ASSERT_NEAR(0, sim_test_ao_offset(true), 1e-9);
+	sim_test_set_setup("AO_MOVE_TIME", 0);
+	stop_connected_simulator(&ccd_ao_simulator);
+}
+
 static bool mount_state_matches(bool connected, double ra, double dec, double tolerance, double timeout) {
 	for (double deadline = indigo_monotonic_time() + timeout; indigo_monotonic_time() < deadline; indigo_usleep(20000)) {
 		indigo_simulated_mount_state state;
@@ -1748,6 +1953,13 @@ int main(int argc, char **argv) {
 		{ "simulator_guider_periodic_error_period_and_amplitude", simulator_guider_periodic_error_period_and_amplitude },
 		{ "simulator_guider_offset_model_pulses_follow_mount_axes", simulator_guider_offset_model_pulses_follow_mount_axes },
 		{ "simulator_guider_camera_follows_mount_simulator_guiding", simulator_guider_camera_follows_mount_simulator_guiding },
+		{ "simulator_oag_camera_streams_a_small_frame", simulator_oag_camera_streams_a_small_frame },
+		{ "simulator_ao_moves_the_oag_star_and_not_the_guidescope_star", simulator_ao_moves_the_oag_star_and_not_the_guidescope_star },
+		{ "simulator_ao_does_not_move_the_guidescope_star_unless_targeted", simulator_ao_does_not_move_the_guidescope_star_unless_targeted },
+		{ "simulator_oag_noise_is_seeded_and_flexure_drifts", simulator_oag_noise_is_seeded_and_flexure_drifts },
+		{ "simulator_ao_relative_moves_are_limited_and_centered", simulator_ao_relative_moves_are_limited_and_centered },
+		{ "simulator_ao_absolute_moves_are_percent_of_the_limit", simulator_ao_absolute_moves_are_percent_of_the_limit },
+		{ "simulator_ao_move_time_keeps_the_property_busy", simulator_ao_move_time_keeps_the_property_busy },
 		{ "simulator_focuser_direction_queued_behind_a_move_keeps_the_last", simulator_focuser_direction_queued_behind_a_move_keeps_the_last },
 		{ "driver_info_reports_simulator_metadata", driver_info_reports_simulator_metadata },
 		{ "simulator_initializes_enumerates_connects_disconnects_and_shuts_down", simulator_initializes_enumerates_connects_disconnects_and_shuts_down },
@@ -1756,6 +1968,7 @@ int main(int argc, char **argv) {
 		{ "ccd_focuser_passes_compliance_checks", ccd_focuser_passes_compliance_checks },
 		{ "ccd_guider_camera_passes_compliance_checks", ccd_guider_camera_passes_compliance_checks },
 		{ "ccd_guider_passes_compliance_checks", ccd_guider_passes_compliance_checks },
+		{ "ccd_oag_camera_passes_compliance_checks", ccd_oag_camera_passes_compliance_checks },
 		{ "ccd_ao_passes_compliance_checks", ccd_ao_passes_compliance_checks },
 		{ "ccd_bahtinov_camera_passes_compliance_checks", ccd_bahtinov_camera_passes_compliance_checks },
 		{ "ccd_dslr_passes_compliance_checks", ccd_dslr_passes_compliance_checks },

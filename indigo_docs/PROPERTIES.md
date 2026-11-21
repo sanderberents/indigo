@@ -483,6 +483,7 @@ A controlled-device selector remains BUSY through connection, CONFIG.LOAD (when 
 | FILTER_AUX_2_LIST | switch | no | no | device name | yes | Hidden by default. Select AUX #2 device. |
 | FILTER_AUX_3_LIST | switch | no | no | device name | yes | Hidden by default. Select AUX #3 device. |
 | FILTER_AUX_4_LIST | switch | no | no | device name | yes | Hidden by default. Select AUX #4 device. |
+| FILTER_AO_LIST | switch | no | no | device name | yes | Hidden by default. Select active optics device. |
 | FILTER_RELATED_CCD_LIST | switch | no | no | device name | yes | Hidden by default. Select related camera. |
 | FILTER_RELATED_WHEEL_LIST | switch | no | no | device name | yes | Hidden by default. Select related filter wheel. |
 | FILTER_RELATED_FOCUSER_LIST | switch | no | no | device name | yes | Hidden by default. Select related focuser. |
@@ -496,6 +497,7 @@ A controlled-device selector remains BUSY through connection, CONFIG.LOAD (when 
 | FILTER_RELATED_AUX_2_LIST | switch | no | no | device name | yes | Hidden by default. Select related AUX #2 device. |
 | FILTER_RELATED_AUX_3_LIST | switch | no | no | device name | yes | Hidden by default. Select related AUX #3 device. |
 | FILTER_RELATED_AUX_4_LIST | switch | no | no | device name | yes | Hidden by default. Select related AUX #4 device. |
+| FILTER_RELATED_AO_LIST | switch | no | no | device name | yes | Hidden by default. Select related active optics device. |
 | FILTER_RELATED_AGENT_LIST | switch | no | no | agent name | yes | Hidden by default. Select related agents. Uses ANY_OF_MANY rule. |
 | FILTER_FORCE_SYMMETRIC_RELATIONS | switch | no | no | ENABLED | yes | Hidden by default. Force symmetric device relations. |
 |  |  |  |  | DISABLED | yes | Disable |
@@ -519,6 +521,27 @@ Agent drivers define these properties on top of the common agent filter properti
 | AGENT_ALPACA_CAMERA_BAYERPAT | text | no | dynamic camera numbers | Per-camera Bayer pattern mapping. |
 
 Source: `indigo_drivers/agent_alpaca/indigo_agent_alpaca.c`.
+
+### AO agent
+
+The agent drives an active optics (AO) device with the images of an off-axis guide camera (OAG) behind it, and slowly hands the deflection of the AO over to the mount. Besides the properties below it publishes the properties of the selected camera, AO, guide port and mount with the usual prefixes (`AO_` properties are not prefixed).
+
+| Property name | Type | RO | Items | Comments |
+| ----- | ----- | ----- | ----- | ----- |
+| FILTER_AO_LIST | switch | no | device name | Select the AO device. |
+| FILTER_CCD_LIST | switch | no | device name | Select the OAG camera. |
+| FILTER_GUIDER_LIST | switch | no | device name | Select the guide port used by the direct mount bump. Optional. |
+| FILTER_MOUNT_LIST | switch | no | device name | Select the mount whose declination, side of pier and slews the agent follows. It is never written. Optional. |
+| FILTER_RELATED_AGENT_LIST | switch | no | agent name | Related Guider Agent. |
+| AGENT_START_PROCESS | switch | no | CALIBRATION, BUMP_CALIBRATION, EXERCISE, CENTER, TRACKING | CALIBRATION measures the axes of the AO through the OAG, BUMP_CALIBRATION pulses the mount and measures the orientation and speed of the OAG image, EXERCISE visits the corners and the centre of the AO range with an interval, CENTER centers the AO, TRACKING closes the loop. |
+| AGENT_ABORT_PROCESS | switch | no | ABORT | Aborts the running process, the AO is centered. |
+| AGENT_AO_MODE | switch | no | RELATIVE, ABSOLUTE | Relative steps (ao_sx) or absolute percent of the deflection (SBIG AO-7). The default follows the driver of the AO. |
+| AGENT_AO_BUMP_MODE | switch | no | AUTO, GUIDER_AGENT, DIRECT, OFF | How the slow part of the deflection is passed to the mount: through AGENT_GUIDER_TARGET_OFFSET while the Guider Agent guides, or by guide pulses of this agent. Only one of them moves the mount at any time. |
+| AGENT_AO_DEC_MODE | switch | no | BOTH, NORTH, SOUTH | Declination pulses the direct bump may send. |
+| AGENT_AO_SETTINGS | number | no | EXPOSURE, SELECTION_RADIUS, GAIN, MIN_MOVE, RANGE, MAX_DEFLECTION, MAX_STEP, CALIBRATION_STEP, CALIBRATION_SETTLE, CALIBRATION_FRAMES, EXERCISE_AMPLITUDE, EXERCISE_INTERVAL, EXERCISE_CYCLES, LOST_FRAMES, AO_TIMEOUT, BUMP_TIME_CONSTANT, BUMP_GAIN, BUMP_INTERVAL, BUMP_THRESHOLD, MIN_PULSE, MAX_PULSE, BUMP_CALIBRATION_PULSE, RA_X, RA_Y, DEC_X, DEC_Y, ANGLE, SCALE_RA, SCALE_DEC, OAG_ANGLE, SPEED_RA, SPEED_DEC, OAG_SIDE_OF_PIER, OAG_COS_DEC | Loop, calibration and bump settings. RANGE is the full deflection of the AO (steps, or percent for an absolute AO) and MAX_DEFLECTION the part of it, in percent, that the agent may use: the distance of the AO position from the centre never exceeds it, which keeps the tilt of the optics under control. RA_X to SCALE_DEC are the result of the AO calibration (star displacement in pixels per AO step), OAG_ANGLE to OAG_COS_DEC of the mount calibration of the OAG. Persistent. |
+| AGENT_AO_STATS | number | yes | PHASE, FRAME_RATE, DRIFT_X, DRIFT_Y, RMSE_X, RMSE_Y, SNR, POSITION_RA, POSITION_DEC, OFFSET_X, OFFSET_Y, BUMP_RA_S, BUMP_DEC_S, BUMP_BACKEND, SATURATED, LOST_FRAMES | Phase (0 idle, 1 tracking, 2 calibrating, 3 exercising, 4 mount calibrating, 5 centering, 6 failed, 7 done), rate of the loop, residual star displacement of the last frame and its RMSE, AO position in steps, AO deflection in OAG pixels, mount bump (arcsec) and its back-end (0 none, 1 Guider Agent, 2 direct pulses). |
+
+Source: `indigo_drivers/agent_ao/indigo_agent_ao.c`.
 
 ### Astrometry agent
 
@@ -580,6 +603,7 @@ Source: `indigo_drivers/agent_config/indigo_agent_config.c`.
 | AGENT_GUIDER_STATS | number | yes | PHASE, FRAME, REFERENCE_X, REFERENCE_Y, DRIFT_X, DRIFT_Y, DRIFT_RA, DRIFT_DEC, DRIFT_RA_S, DRIFT_DEC_S, CORR_RA, CORR_DEC, RMSE_RA, RMSE_DEC, RMSE_RA_S, RMSE_DEC_S, RMSE_RA_ST, RMSE_DEC_ST, RMSE_RA_S_ST, RMSE_DEC_S_ST, SNR, DELAY, DITHERING, PPEC_LEARNING, PPEC_PERIOD, MKGP_LEARNING, MKGP_PERIOD, MKGP_PERIOD2, MKGP_STRENGTH2, CORR_RESPONSE_RA, CORR_RESPONSE_DEC | Guider process statistics. |
 | AGENT_GUIDER_LOG | text | no | DIR, TEMPLATE | Guider log output location and filename template. |
 | AGENT_GUIDER_DITHERING_OFFSETS | number | no | X, Y | Manual dithering offsets. |
+| AGENT_GUIDER_TARGET_OFFSET | number | no | RA, DEC | Offset of the lock position in arcsec on the sky, set by a related agent (AO agent) to make the mount follow it slowly. Applied only while guiding, limited to 0.8 of the selection radius, set to 0 at calibration, preview and guiding start. |
 | AGENT_GUIDER_DITHERING_STRATEGY | switch | no | RANDOMIZED_SPIRAL, RANDOM, SPIRAL | Dithering pattern selection. |
 | AGENT_GUIDER_DITHER | switch | no | TRIGGER, RESET | Trigger or reset dithering. |
 | AGENT_GUIDER_RESET_PPEC | switch | no | RESET | Reset the predictive PEC model. |

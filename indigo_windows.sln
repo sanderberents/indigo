@@ -26,6 +26,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "make_indigo_drivers", "indi
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "indigo_agent_mount", "indigo_drivers\agent_mount\indigo_agent_mount.vcxproj", "{D7058517-71DF-4F6B-865D-6038B2D6085C}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "indigo_agent_ao", "indigo_drivers\agent_ao\indigo_agent_ao.vcxproj", "{7A3C9E52-4B1D-4F6A-9C2E-5D8B1F0A6E37}"
+EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "indigo_agent_auxiliary", "indigo_drivers\agent_auxiliary\indigo_agent_auxiliary.vcxproj", "{5F021221-5611-4173-9AF4-87B43FD3E3A5}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "indigo_agent_scheduler", "indigo_drivers\agent_scheduler\indigo_agent_scheduler.vcxproj", "{F258F247-5ED1-48FA-AA38-27A86414F19A}"
@@ -392,6 +394,14 @@ Global
 		{5F021221-5611-4173-9AF4-87B43FD3E3A5}.Release|ARM64.Build.0 = Release|ARM64
 		{5F021221-5611-4173-9AF4-87B43FD3E3A5}.Release|x64.ActiveCfg = Release|x64
 		{5F021221-5611-4173-9AF4-87B43FD3E3A5}.Release|x64.Build.0 = Release|x64
+		{7A3C9E52-4B1D-4F6A-9C2E-5D8B1F0A6E37}.Debug|ARM64.ActiveCfg = Debug|ARM64
+		{7A3C9E52-4B1D-4F6A-9C2E-5D8B1F0A6E37}.Debug|ARM64.Build.0 = Debug|ARM64
+		{7A3C9E52-4B1D-4F6A-9C2E-5D8B1F0A6E37}.Debug|x64.ActiveCfg = Debug|x64
+		{7A3C9E52-4B1D-4F6A-9C2E-5D8B1F0A6E37}.Debug|x64.Build.0 = Debug|x64
+		{7A3C9E52-4B1D-4F6A-9C2E-5D8B1F0A6E37}.Release|ARM64.ActiveCfg = Release|ARM64
+		{7A3C9E52-4B1D-4F6A-9C2E-5D8B1F0A6E37}.Release|ARM64.Build.0 = Release|ARM64
+		{7A3C9E52-4B1D-4F6A-9C2E-5D8B1F0A6E37}.Release|x64.ActiveCfg = Release|x64
+		{7A3C9E52-4B1D-4F6A-9C2E-5D8B1F0A6E37}.Release|x64.Build.0 = Release|x64
 		{F258F247-5ED1-48FA-AA38-27A86414F19A}.Debug|ARM64.ActiveCfg = Debug|ARM64
 		{F258F247-5ED1-48FA-AA38-27A86414F19A}.Debug|ARM64.Build.0 = Debug|ARM64
 		{F258F247-5ED1-48FA-AA38-27A86414F19A}.Debug|x64.ActiveCfg = Debug|x64

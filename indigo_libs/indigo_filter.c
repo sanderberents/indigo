@@ -34,10 +34,10 @@
 
 #include <indigo/indigo_filter.h>
 
-static int interface_mask[INDIGO_FILTER_LIST_COUNT] = { INDIGO_INTERFACE_CCD, INDIGO_INTERFACE_WHEEL, INDIGO_INTERFACE_FOCUSER, INDIGO_INTERFACE_ROTATOR, INDIGO_INTERFACE_MOUNT, INDIGO_INTERFACE_GUIDER, INDIGO_INTERFACE_DOME, INDIGO_INTERFACE_GPS, INDIGO_INTERFACE_AUX_JOYSTICK, INDIGO_INTERFACE_AUX, INDIGO_INTERFACE_AUX, INDIGO_INTERFACE_AUX, INDIGO_INTERFACE_AUX };
-static char *property_name_prefix[INDIGO_FILTER_LIST_COUNT] = { "CCD_", "WHEEL_", "FOCUSER_", "ROTATOR_", "MOUNT_", "GUIDER_", "DOME_", "GPS_", "JOYSTICK_", "AUX_1_", "AUX_2_", "AUX_3_", "AUX_4_" };
-static int property_name_prefix_len[INDIGO_FILTER_LIST_COUNT] = { 4, 6, 8, 8, 6, 7, 5, 4, 9, 6, 6, 6, 6 };
-static char *property_name_label[INDIGO_FILTER_LIST_COUNT] = { "Camera ", "Filter Wheel ", "Focuser ", "Rotator ", "Mount ", "Guider ", "Dome ", "GPS ", "Joystick ", "AUX #1 ", "AUX #2 ", "AUX #3 ", "AUX #4 " };
+static int interface_mask[INDIGO_FILTER_LIST_COUNT] = { INDIGO_INTERFACE_CCD, INDIGO_INTERFACE_WHEEL, INDIGO_INTERFACE_FOCUSER, INDIGO_INTERFACE_ROTATOR, INDIGO_INTERFACE_MOUNT, INDIGO_INTERFACE_GUIDER, INDIGO_INTERFACE_DOME, INDIGO_INTERFACE_GPS, INDIGO_INTERFACE_AUX_JOYSTICK, INDIGO_INTERFACE_AUX, INDIGO_INTERFACE_AUX, INDIGO_INTERFACE_AUX, INDIGO_INTERFACE_AUX, INDIGO_INTERFACE_AO };
+static char *property_name_prefix[INDIGO_FILTER_LIST_COUNT] = { "CCD_", "WHEEL_", "FOCUSER_", "ROTATOR_", "MOUNT_", "GUIDER_", "DOME_", "GPS_", "JOYSTICK_", "AUX_1_", "AUX_2_", "AUX_3_", "AUX_4_", "AO_" };
+static int property_name_prefix_len[INDIGO_FILTER_LIST_COUNT] = { 4, 6, 8, 8, 6, 7, 5, 4, 9, 6, 6, 6, 6, 3 };
+static char *property_name_label[INDIGO_FILTER_LIST_COUNT] = { "Camera ", "Filter Wheel ", "Focuser ", "Rotator ", "Mount ", "Guider ", "Dome ", "GPS ", "Joystick ", "AUX #1 ", "AUX #2 ", "AUX #3 ", "AUX #4 ", "AO " };
 
 indigo_result indigo_filter_device_attach(indigo_device *device, const char* driver_name, unsigned version, indigo_device_interface device_interface) {
 	assert(device != NULL);
@@ -152,6 +152,14 @@ indigo_result indigo_filter_device_attach(indigo_device *device, const char* dri
 			FILTER_AUX_4_LIST_PROPERTY->hidden = true;
 			FILTER_AUX_4_LIST_PROPERTY->count = 1;
 			indigo_init_switch_item(FILTER_AUX_4_LIST_PROPERTY->items, FILTER_DEVICE_LIST_NONE_ITEM_NAME, "No AUX device #4", true);
+			// -------------------------------------------------------------------------------- AO property
+			FILTER_AO_LIST_PROPERTY = indigo_init_switch_property(NULL, device->name, FILTER_AO_LIST_PROPERTY_NAME, MAIN_GROUP, "Active optics list", INDIGO_OK_STATE, INDIGO_RW_PERM, INDIGO_ONE_OF_MANY_RULE, INDIGO_FILTER_MAX_DEVICES);
+			if (FILTER_AO_LIST_PROPERTY == NULL) {
+				return INDIGO_FAILED;
+			}
+			FILTER_AO_LIST_PROPERTY->hidden = true;
+			FILTER_AO_LIST_PROPERTY->count = 1;
+			indigo_init_switch_item(FILTER_AO_LIST_PROPERTY->items, FILTER_DEVICE_LIST_NONE_ITEM_NAME, "No active optics", true);
 			// -------------------------------------------------------------------------------- Related CCD property
 			FILTER_RELATED_CCD_LIST_PROPERTY = indigo_init_switch_property(NULL, device->name, FILTER_RELATED_CCD_LIST_PROPERTY_NAME, MAIN_GROUP, "Related CCD list", INDIGO_OK_STATE, INDIGO_RW_PERM, INDIGO_ONE_OF_MANY_RULE, INDIGO_FILTER_MAX_DEVICES);
 			if (FILTER_RELATED_CCD_LIST_PROPERTY == NULL) {
@@ -256,6 +264,14 @@ indigo_result indigo_filter_device_attach(indigo_device *device, const char* dri
 			FILTER_RELATED_AUX_4_LIST_PROPERTY->hidden = true;
 			FILTER_RELATED_AUX_4_LIST_PROPERTY->count = 1;
 			indigo_init_switch_item(FILTER_RELATED_AUX_4_LIST_PROPERTY->items, FILTER_DEVICE_LIST_NONE_ITEM_NAME, "No AUX device #4", true);
+			// -------------------------------------------------------------------------------- Related AO property
+			FILTER_RELATED_AO_LIST_PROPERTY = indigo_init_switch_property(NULL, device->name, FILTER_RELATED_AO_LIST_PROPERTY_NAME, MAIN_GROUP, "Related active optics list", INDIGO_OK_STATE, INDIGO_RW_PERM, INDIGO_ONE_OF_MANY_RULE, INDIGO_FILTER_MAX_DEVICES);
+			if (FILTER_RELATED_AO_LIST_PROPERTY == NULL) {
+				return INDIGO_FAILED;
+			}
+			FILTER_RELATED_AO_LIST_PROPERTY->hidden = true;
+			FILTER_RELATED_AO_LIST_PROPERTY->count = 1;
+			indigo_init_switch_item(FILTER_RELATED_AO_LIST_PROPERTY->items, FILTER_DEVICE_LIST_NONE_ITEM_NAME, "No active optics", true);
 			// -------------------------------------------------------------------------------- Related agents property
 			FILTER_RELATED_AGENT_LIST_PROPERTY = indigo_init_switch_property(NULL, device->name, FILTER_RELATED_AGENT_LIST_PROPERTY_NAME, MAIN_GROUP, "Related agent list", INDIGO_OK_STATE, INDIGO_RW_PERM, INDIGO_ANY_OF_MANY_RULE, INDIGO_FILTER_MAX_DEVICES);
 			if (FILTER_RELATED_AGENT_LIST_PROPERTY == NULL) {

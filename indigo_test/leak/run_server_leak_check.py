@@ -62,7 +62,7 @@ OPERATIONS = {
 
 
 # All logical devices of the fixed simulator set, including devices without motion exercises.
-EXPECTED_DEVICES = frozenset(OPERATIONS) | {"GPS Simulator", "Polar Aligner Simulator", "PowerBox Simulator", "Weather Station Simulator", "SQM Simulator", "CCD Bahtinov Mask Simulator", "DSLR Simulator", "CCD File Simulator", "CCD Guider Simulator (AO)"}
+EXPECTED_DEVICES = frozenset(OPERATIONS) | {"GPS Simulator", "Polar Aligner Simulator", "PowerBox Simulator", "Weather Station Simulator", "SQM Simulator", "CCD Bahtinov Mask Simulator", "DSLR Simulator", "CCD File Simulator", "CCD Guider Simulator (AO)", "CCD OAG Simulator"}
 
 
 def wait_for_devices(server):

@@ -135,6 +135,7 @@
 #include "system_ascol/indigo_system_ascol.h"
 #include "focuser_steeldrive2/indigo_focuser_steeldrive2.h"
 #include "agent_auxiliary/indigo_agent_auxiliary.h"
+#include "agent_ao/indigo_agent_ao.h"
 #include "aux_sqm/indigo_aux_sqm.h"
 #include "focuser_dsd/indigo_focuser_dsd.h"
 #include "ccd_ptp/indigo_ccd_ptp.h"
@@ -229,6 +230,7 @@
 driver_entry_point static_drivers[] = {
 #ifdef STATIC_DRIVERS
 	indigo_agent_alpaca,
+	indigo_agent_ao,
 	indigo_agent_astrometry,
 	indigo_agent_auxiliary,
 	indigo_agent_guider,
