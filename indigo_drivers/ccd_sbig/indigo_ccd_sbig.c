@@ -1153,7 +1153,16 @@ static indigo_result ccd_attach(indigo_device *device) {
 
 
 static void handle_exposure_property(indigo_device *device) {
+	/* The countdown setup cancels a running countdown task and waits for it, and that task publishes properties on the
+	   bus. It must therefore not run in ccd_change_property(), where the bus lock is held, but here. */
+	indigo_use_shortest_exposure_if_bias(device);
+	indigo_ccd_exposure_setup(device);
 	long ok = sbig_start_exposure(device, CCD_EXPOSURE_ITEM->number.target, CCD_FRAME_TYPE_DARK_ITEM->sw.value || CCD_FRAME_TYPE_DARKFLAT_ITEM->sw.value || CCD_FRAME_TYPE_BIAS_ITEM->sw.value, CCD_FRAME_LEFT_ITEM->number.value, CCD_FRAME_TOP_ITEM->number.value, CCD_FRAME_WIDTH_ITEM->number.value, CCD_FRAME_HEIGHT_ITEM->number.value, CCD_BIN_HORIZONTAL_ITEM->number.value, CCD_BIN_VERTICAL_ITEM->number.value);
+	if (ok && CCD_EXPOSURE_PROPERTY->state != INDIGO_BUSY_STATE) {
+		/* aborted while the exposure was being started */
+		sbig_abort_exposure(device);
+		return;
+	}
 	if (ok) {
 		if (CCD_UPLOAD_MODE_LOCAL_ITEM->sw.value || CCD_UPLOAD_MODE_BOTH_ITEM->sw.value) {
 			CCD_IMAGE_FILE_PROPERTY->state = INDIGO_BUSY_STATE;
@@ -1452,6 +1461,26 @@ static void ccd_connect_callback(indigo_device *device) {
 	indigo_unlock_master_device(device);
 }
 
+/* Runs outside the bus lock, the cleanup cancels a running countdown task and waits for it, see handle_exposure_property() */
+static void abort_exposure_handler(indigo_device *device) {
+	if (CCD_EXPOSURE_PROPERTY->state == INDIGO_BUSY_STATE) {
+		/* a pending timer would read out the next exposure too early */
+		if (PRIMARY_CCD) {
+			indigo_cancel_timer(device, &PRIVATE_DATA->imager_ccd_exposure_timer);
+		} else {
+			indigo_cancel_timer(device, &PRIVATE_DATA->guider_ccd_exposure_timer);
+		}
+		sbig_abort_exposure(device);
+	}
+	if (PRIMARY_CCD) {
+		PRIVATE_DATA->imager_no_check_temperature = false;
+	} else {
+		PRIVATE_DATA->guider_no_check_temperature = false;
+	}
+	indigo_ccd_abort_exposure_cleanup(device);
+}
+
+
 static indigo_result ccd_change_property(indigo_device *device, indigo_client *client, indigo_property *property) {
 	assert(device != NULL);
 	assert(DEVICE_CONTEXT != NULL);
@@ -1477,23 +1506,12 @@ static indigo_result ccd_change_property(indigo_device *device, indigo_client *c
 			indigo_update_property(device, CCD_EXPOSURE_PROPERTY, NULL);
 			indigo_set_timer(device, 0, handle_exposure_property, NULL);
 		}
+		return INDIGO_OK;
 	// -------------------------------------------------------------------------------- CCD_ABORT_EXPOSURE
 	} else if (indigo_property_match_changeable(CCD_ABORT_EXPOSURE_PROPERTY, property)) {
-		if (CCD_EXPOSURE_PROPERTY->state == INDIGO_BUSY_STATE) {
-			/* a pending timer would read out the next exposure too early */
-			if (PRIMARY_CCD) {
-				indigo_cancel_timer(device, &PRIVATE_DATA->imager_ccd_exposure_timer);
-			} else {
-				indigo_cancel_timer(device, &PRIVATE_DATA->guider_ccd_exposure_timer);
-			}
-			sbig_abort_exposure(device);
-		}
-		if (PRIMARY_CCD) {
-			PRIVATE_DATA->imager_no_check_temperature = false;
-		} else {
-			PRIVATE_DATA->guider_no_check_temperature = false;
-		}
 		indigo_property_copy_values(CCD_ABORT_EXPOSURE_PROPERTY, property, false);
+		indigo_set_timer(device, 0, abort_exposure_handler, NULL);
+		return INDIGO_OK;
 	// -------------------------------------------------------------------------------- CCD_BIN
 	} else if (indigo_property_match_changeable(CCD_BIN_PROPERTY, property)) {
 		int prev_bin_x = (int)CCD_BIN_HORIZONTAL_ITEM->number.value;
