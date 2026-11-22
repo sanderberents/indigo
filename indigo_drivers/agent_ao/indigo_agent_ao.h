@@ -16,7 +16,7 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-/** INDIGO Active optics agent
+/** INDIGO Adaptive optics agent
  \file indigo_agent_ao.h
  */
 

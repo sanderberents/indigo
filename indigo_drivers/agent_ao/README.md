@@ -1,6 +1,6 @@
-# Active optics agent
+# Adaptive optics agent
 
-Backend implementation of active optics (AO) control. The agent drives an AO with the images of an off-axis guide camera (OAG) behind it, and slowly hands the deflection of the AO over to the mount.
+Backend implementation of adaptive optics (AO) control. The agent drives an AO with the images of an off-axis guide camera (OAG) behind it, and slowly hands the deflection of the AO over to the mount.
 
 ## Supported devices
 

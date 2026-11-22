@@ -123,7 +123,7 @@ extern "C" {
 */
 #define FILTER_AUX_4_LIST_PROPERTY		(FILTER_DEVICE_CONTEXT->filter_device_list_properties[INDIGO_FILTER_AUX_4_INDEX])
 
-/** Active optics list switch property.
+/** Adaptive optics list switch property.
 */
 #define FILTER_AO_LIST_PROPERTY		(FILTER_DEVICE_CONTEXT->filter_device_list_properties[INDIGO_FILTER_AO_INDEX])
 
@@ -179,7 +179,7 @@ extern "C" {
 */
 #define FILTER_RELATED_AUX_4_LIST_PROPERTY		(FILTER_DEVICE_CONTEXT->filter_related_device_list_properties[INDIGO_FILTER_AUX_4_INDEX])
 
-/** Related active optics list switch property.
+/** Related adaptive optics list switch property.
 */
 #define FILTER_RELATED_AO_LIST_PROPERTY		(FILTER_DEVICE_CONTEXT->filter_related_device_list_properties[INDIGO_FILTER_AO_INDEX])
 

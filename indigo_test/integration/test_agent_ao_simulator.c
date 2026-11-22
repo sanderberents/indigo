@@ -361,7 +361,7 @@ static void processes_refuse_without_an_ao(void) {
 	unsigned before = revision(AO, AGENT_START_PROCESS_PROPERTY_NAME);
 	CHECK(change_switch(AO, AGENT_START_PROCESS_PROPERTY_NAME, AGENT_AO_CENTER_ITEM_NAME, true));
 	CHECK(WAIT_UNTIL(revision(AO, AGENT_START_PROCESS_PROPERTY_NAME) > before && state(AO, AGENT_START_PROCESS_PROPERTY_NAME) == INDIGO_ALERT_STATE, 20));
-	CHECK(has_message("No active optics selected"));
+	CHECK(has_message("No adaptive optics selected"));
 }
 
 static const indigo_test_case tests[] = {

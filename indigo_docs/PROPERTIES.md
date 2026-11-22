@@ -483,7 +483,7 @@ A controlled-device selector remains BUSY through connection, CONFIG.LOAD (when 
 | FILTER_AUX_2_LIST | switch | no | no | device name | yes | Hidden by default. Select AUX #2 device. |
 | FILTER_AUX_3_LIST | switch | no | no | device name | yes | Hidden by default. Select AUX #3 device. |
 | FILTER_AUX_4_LIST | switch | no | no | device name | yes | Hidden by default. Select AUX #4 device. |
-| FILTER_AO_LIST | switch | no | no | device name | yes | Hidden by default. Select active optics device. |
+| FILTER_AO_LIST | switch | no | no | device name | yes | Hidden by default. Select adaptive optics device. |
 | FILTER_RELATED_CCD_LIST | switch | no | no | device name | yes | Hidden by default. Select related camera. |
 | FILTER_RELATED_WHEEL_LIST | switch | no | no | device name | yes | Hidden by default. Select related filter wheel. |
 | FILTER_RELATED_FOCUSER_LIST | switch | no | no | device name | yes | Hidden by default. Select related focuser. |
@@ -497,7 +497,7 @@ A controlled-device selector remains BUSY through connection, CONFIG.LOAD (when 
 | FILTER_RELATED_AUX_2_LIST | switch | no | no | device name | yes | Hidden by default. Select related AUX #2 device. |
 | FILTER_RELATED_AUX_3_LIST | switch | no | no | device name | yes | Hidden by default. Select related AUX #3 device. |
 | FILTER_RELATED_AUX_4_LIST | switch | no | no | device name | yes | Hidden by default. Select related AUX #4 device. |
-| FILTER_RELATED_AO_LIST | switch | no | no | device name | yes | Hidden by default. Select related active optics device. |
+| FILTER_RELATED_AO_LIST | switch | no | no | device name | yes | Hidden by default. Select related adaptive optics device. |
 | FILTER_RELATED_AGENT_LIST | switch | no | no | agent name | yes | Hidden by default. Select related agents. Uses ANY_OF_MANY rule. |
 | FILTER_FORCE_SYMMETRIC_RELATIONS | switch | no | no | ENABLED | yes | Hidden by default. Force symmetric device relations. |
 |  |  |  |  | DISABLED | yes | Disable |
@@ -524,7 +524,7 @@ Source: `indigo_drivers/agent_alpaca/indigo_agent_alpaca.c`.
 
 ### AO agent
 
-The agent drives an active optics (AO) device with the images of an off-axis guide camera (OAG) behind it, and slowly hands the deflection of the AO over to the mount. Besides the properties below it publishes the properties of the selected camera, AO, guide port and mount with the usual prefixes (`AO_` properties are not prefixed).
+The agent drives an adaptive optics (AO) device with the images of an off-axis guide camera (OAG) behind it, and slowly hands the deflection of the AO over to the mount. Besides the properties below it publishes the properties of the selected camera, AO, guide port and mount with the usual prefixes (`AO_` properties are not prefixed).
 
 | Property name | Type | RO | Items | Comments |
 | ----- | ----- | ----- | ----- | ----- |

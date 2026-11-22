@@ -16,10 +16,10 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-/** INDIGO Active optics agent
+/** INDIGO Adaptive optics agent
  \file indigo_agent_ao.c
 
- The agent owns an off-axis guide camera (OAG) behind the active optics. Its images are tracked at the rate of the
+ The agent owns an off-axis guide camera (OAG) behind the adaptive optics. Its images are tracked at the rate of the
  camera (CCD_STREAMING, a series of single exposures as a fallback) and the AO is moved to reduce the star displacement d (gain GAIN per frame, dead-band MIN_MOVE),
  which makes a closed loop: the AO deflection a (in OAG pixels) is part of the star position the camera sees. The slow
  part of the deflection is handed over to the mount, "bumped", so that the AO relaxes to its centre: the total mount
@@ -883,7 +883,7 @@ static void process_end(indigo_device *device, bool ok, const char *message) {
 
 static bool ao_ready(indigo_device *device) {
 	if (!INDIGO_FILTER_AO_SELECTED) {
-		indigo_send_message(device, ALERT_PROPERTY, "No active optics selected");
+		indigo_send_message(device, ALERT_PROPERTY, "No adaptive optics selected");
 		return false;
 	}
 	return true;
