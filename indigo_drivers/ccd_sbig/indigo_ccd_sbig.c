@@ -615,9 +615,27 @@ static bool sbig_start_exposure(indigo_device *device, double exposure, bool dar
 			indigo_ccd_suspend_countdown(device);
 			INDIGO_DRIVER_DEBUG(DRIVER_NAME, "Need to wait for the secondary CCD to finish (status = 0x%x)", status);
 		}
+		int wait_cycles = 6000; /* 6000 * 100 ms = 10 min */
 		while (status == 8) { /* Wait for it to finish otherwise it will close the shutter while main camera is exposing */
+			/* do not hold the driver mutex while waiting, the other CCD, abort and the cooler need it */
+			pthread_mutex_unlock(&driver_mutex);
 			indigo_usleep(100000); // 100ms
-			get_command_status(CC_START_EXPOSURE2, &status);
+			pthread_mutex_lock(&driver_mutex);
+			res = set_sbig_handle(PRIVATE_DATA->driver_handle);
+			if (res == CE_NO_ERROR) {
+				res = get_command_status(CC_START_EXPOSURE2, &status);
+			}
+			/* a failed query leaves the status unchanged, so never keep waiting on it */
+			if ((res != CE_NO_ERROR) || (--wait_cycles <= 0)) {
+				if (res != CE_NO_ERROR) {
+					INDIGO_DRIVER_ERROR(DRIVER_NAME, "Waiting for the secondary CCD failed: %d (%s)", res, sbig_error_string(res));
+				} else {
+					INDIGO_DRIVER_ERROR(DRIVER_NAME, "Waiting for the secondary CCD timed out");
+				}
+				indigo_ccd_resume_countdown(device);
+				pthread_mutex_unlock(&driver_mutex);
+				return false;
+			}
 		}
 		indigo_ccd_resume_countdown(device);
 
