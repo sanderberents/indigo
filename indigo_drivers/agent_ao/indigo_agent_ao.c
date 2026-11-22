@@ -26,6 +26,10 @@
  displacement T integrates a with a long time constant, and is realised by slow, rare pulses to a guide port selected in
  this agent. While a related Guider Agent is busy, this agent never moves the mount and pauses the loop while it dithers.
 
+ A related Guider Agent does the dithering. Without one, this agent dithers for a related Imager Agent: when an exposure of the Imager Agent has
+ finished, the AO tilts the star by a small random offset (the dither d, in OAG pixels) by moving the reference of the
+ loop, which needs no mount motion. The mount bump ignores d.
+
  Conventions: all vectors are star displacements in the pixels of the OAG frame. The RA axis is the direction in which
  the star moves when the mount is pulsed west, positive Dec is the direction of a north pulse. An AO axis is positive
  along the EAST and NORTH item (relative mode: steps, absolute mode: percent of full deflection).
@@ -53,6 +57,14 @@
 #define FRAME_TIMEOUT 3.0
 #define STATS_PERIOD 0.5
 #define GUIDER_AGENT_PREFIX "Guider Agent"
+#define IMAGER_AGENT_PREFIX "Imager Agent"
+#define DITHER_SKIP_FRAMES 2
+
+#if defined(INDIGO_WINDOWS)
+static double drand48() {
+	return (double)rand() / (RAND_MAX + 1.0);
+}
+#endif
 
 #define DEVICE_PRIVATE_DATA ((ao_agent_private_data *)device->private_data)
 #define CLIENT_PRIVATE_DATA ((ao_agent_private_data *)FILTER_CLIENT_CONTEXT->device->private_data)
@@ -87,6 +99,8 @@ enum {
 	S_MIN_PULSE,
 	S_MAX_PULSE,
 	S_CAL_PULSE,
+	S_DITHER_AMPLITUDE,
+	S_DITHER_FRAMES,
 	S_RA_X,
 	S_RA_Y,
 	S_DEC_X,
@@ -124,6 +138,8 @@ static const setting_definition settings_definitions[S_COUNT] = {
 	{ "MIN_PULSE", "Minimum pulse (s)", 0.001, 5, 0, 0.02 },
 	{ "MAX_PULSE", "Maximum pulse (s)", 0.01, 30, 0, 1 },
 	{ "BUMP_CALIBRATION_PULSE", "Mount calibration pulse (s)", 0.05, 30, 0, 1 },
+	{ "DITHER_AMPLITUDE", "Dither amplitude (px, 0 = no dithering)", 0, 50, 0, 0 },
+	{ "DITHER_FRAMES", "Exposures between dithers", 1, 1000, 1, 1 },
 	{ "RA_X", "AO RA axis X (px/step)", -1000, 1000, 0, 0 },
 	{ "RA_Y", "AO RA axis Y (px/step)", -1000, 1000, 0, 0 },
 	{ "DEC_X", "AO Dec axis X (px/step)", -1000, 1000, 0, 0 },
@@ -153,6 +169,8 @@ enum {
 	T_BUMP_RA_S,
 	T_BUMP_DEC_S,
 	T_BUMP_ACTIVE,
+	T_DITHER_X,
+	T_DITHER_Y,
 	T_SATURATED,
 	T_LOST,
 	T_COUNT
@@ -173,6 +191,8 @@ static const setting_definition stats_definitions[T_COUNT] = {
 	{ "BUMP_RA_S", "Mount bump RA (arcsec)", -100000, 100000, 0, 0 },
 	{ "BUMP_DEC_S", "Mount bump Dec (arcsec)", -100000, 100000, 0, 0 },
 	{ "BUMP_ACTIVE", "Mount bump active", 0, 1, 0, 0 },
+	{ "DITHER_X", "Dither X (px)", -10000, 10000, 0, 0 },
+	{ "DITHER_Y", "Dither Y (px)", -10000, 10000, 0, 0 },
 	{ "SATURATED", "AO at its limit", 0, 1, 0, 0 },
 	{ "LOST_FRAMES", "Frames without star", 0, 1000000, 0, 0 }
 };
@@ -228,6 +248,12 @@ typedef struct {
 	volatile indigo_property_state guider_start_state;
 	volatile indigo_property_state guider_dither_state;
 	bool bump_active;
+	double dither_x, dither_y;
+	int skip_frames;
+	unsigned dither_seen, dither_count;
+	volatile unsigned imager_exposures;
+	volatile indigo_property_state imager_exposure_state;
+	volatile indigo_property_state imager_start_state;
 	double bump_x, bump_y;
 	double done_x, done_y;
 	double bump_time;
@@ -304,6 +330,8 @@ static void update_stats(indigo_device *device) {
 	STAT(T_SATURATED) = DEVICE_PRIVATE_DATA->saturated ? 1 : 0;
 	STAT(T_LOST) = DEVICE_PRIVATE_DATA->lost_frames;
 	STAT(T_BUMP_ACTIVE) = DEVICE_PRIVATE_DATA->bump_active ? 1 : 0;
+	STAT(T_DITHER_X) = round(1000 * DEVICE_PRIVATE_DATA->dither_x) / 1000;
+	STAT(T_DITHER_Y) = round(1000 * DEVICE_PRIVATE_DATA->dither_y) / 1000;
 	indigo_update_property(device, AGENT_AO_STATS_PROPERTY, NULL);
 }
 
@@ -647,6 +675,7 @@ static bool ao_center(indigo_device *device) {
 	}
 	DEVICE_PRIVATE_DATA->pos_ra = DEVICE_PRIVATE_DATA->pos_dec = 0;
 	DEVICE_PRIVATE_DATA->want_ra = DEVICE_PRIVATE_DATA->want_dec = 0;
+	DEVICE_PRIVATE_DATA->dither_x = DEVICE_PRIVATE_DATA->dither_y = 0;
 	DEVICE_PRIVATE_DATA->saturated = false;
 	return true;
 }
@@ -690,6 +719,11 @@ static bool guider_agent_name(indigo_device *device, char *name) {
 
 // -------------------------------------------------------------------------------- bump
 
+static bool guider_agent_related(indigo_device *device) {
+	char name[INDIGO_NAME_SIZE];
+	return guider_agent_name(device, name);
+}
+
 static bool guider_agent_busy(indigo_device *device) {
 	char name[INDIGO_NAME_SIZE];
 	return guider_agent_name(device, name) && DEVICE_PRIVATE_DATA->guider_start_state == INDIGO_BUSY_STATE;
@@ -722,6 +756,8 @@ static void bump_step(indigo_device *device, double dt) {
 	}
 	double a_x, a_y;
 	steps_to_px(device, DEVICE_PRIVATE_DATA->pos_ra, DEVICE_PRIVATE_DATA->pos_dec, &a_x, &a_y);
+	a_x -= DEVICE_PRIVATE_DATA->dither_x;
+	a_y -= DEVICE_PRIVATE_DATA->dither_y;
 	double factor = SET(S_BUMP_GAIN) * dt / SET(S_BUMP_TAU);
 	DEVICE_PRIVATE_DATA->bump_x += a_x * factor;
 	DEVICE_PRIVATE_DATA->bump_y += a_y * factor;
@@ -970,6 +1006,34 @@ static bool dither_active(indigo_device *device) {
 	return guider_agent_busy(device) && (DEVICE_PRIVATE_DATA->guider_dithering != 0 || DEVICE_PRIVATE_DATA->guider_dither_state == INDIGO_BUSY_STATE);
 }
 
+// An exposure of the related Imager Agent has finished: tilt the star by a new random offset, the AO moves at once and the
+// reference of the loop follows, so that the loop does not undo the dither. The dither is the offset from the reference, not a sum of steps.
+static void dither_step(indigo_device *device) {
+	unsigned done = DEVICE_PRIVATE_DATA->imager_exposures;
+	if (done == DEVICE_PRIVATE_DATA->dither_seen) {
+		return;
+	}
+	DEVICE_PRIVATE_DATA->dither_count += done - DEVICE_PRIVATE_DATA->dither_seen;
+	DEVICE_PRIVATE_DATA->dither_seen = done;
+	double amplitude = SET(S_DITHER_AMPLITUDE);
+	if (amplitude <= 0 || DEVICE_PRIVATE_DATA->dither_count < (unsigned)SET(S_DITHER_FRAMES) || DEVICE_PRIVATE_DATA->imager_start_state != INDIGO_BUSY_STATE || guider_agent_related(device)) {
+		return;
+	}
+	DEVICE_PRIVATE_DATA->dither_count = 0;
+	double x = amplitude * (2 * drand48() - 1);
+	double y = amplitude * (2 * drand48() - 1);
+	double steps_ra, steps_dec;
+	px_to_steps(device, x - DEVICE_PRIVATE_DATA->dither_x, y - DEVICE_PRIVATE_DATA->dither_y, &steps_ra, &steps_dec);
+	double new_ra = DEVICE_PRIVATE_DATA->want_ra + steps_ra;
+	double new_dec = DEVICE_PRIVATE_DATA->want_dec + steps_dec;
+	DEVICE_PRIVATE_DATA->saturated = hypot(new_ra, new_dec) > deflection_limit(device);
+	ao_move_to(device, new_ra, new_dec);
+	DEVICE_PRIVATE_DATA->dither_x = x;
+	DEVICE_PRIVATE_DATA->dither_y = y;
+	DEVICE_PRIVATE_DATA->skip_frames = DITHER_SKIP_FRAMES;
+	update_stats(device);
+}
+
 // The fast loop: every frame the AO is moved to reduce the displacement of the star, the slow loop bumps the mount
 static void tracking_process(indigo_device *device) {
 	process_begin(device, AGENT_AO_PHASE_TRACKING);
@@ -981,6 +1045,9 @@ static void tracking_process(indigo_device *device) {
 	ok = ok && start_frames(device) && ao_center(device);
 	bump_reset(device);
 	DEVICE_PRIVATE_DATA->bump_active = false;
+	DEVICE_PRIVATE_DATA->skip_frames = 0;
+	DEVICE_PRIVATE_DATA->dither_seen = DEVICE_PRIVATE_DATA->imager_exposures;
+	DEVICE_PRIVATE_DATA->dither_count = 0;
 	bool frozen = false;
 	double last_time = indigo_monotonic_time();
 	DEVICE_PRIVATE_DATA->stats_time = last_time;
@@ -1004,14 +1071,20 @@ static void tracking_process(indigo_device *device) {
 			relock(device);
 			last_time = indigo_monotonic_time();
 		}
+		dither_step(device);
 		if (!get_frame(device, FRAME_TIMEOUT)) {
 			if (aborted(device)) {
 				break;
 			}
 			DEVICE_PRIVATE_DATA->lost_frames++;
+		} else if (DEVICE_PRIVATE_DATA->skip_frames > 0) {
+			// frames exposed before the AO settled show the star at its old position
+			DEVICE_PRIVATE_DATA->skip_frames--;
 		} else {
 			double dx, dy;
 			if (analyze_frame(device, &dx, &dy)) {
+				dx -= DEVICE_PRIVATE_DATA->dither_x;
+				dy -= DEVICE_PRIVATE_DATA->dither_y;
 				DEVICE_PRIVATE_DATA->lost_frames = 0;
 				DEVICE_PRIVATE_DATA->rate_frames++;
 				double min_move = SET(S_MIN_MOVE);
@@ -1088,6 +1161,23 @@ static void snoop_guider_agent(indigo_client *client, indigo_property *property)
 	}
 }
 
+// The end of an exposure of the related Imager Agent is CCD_EXPOSURE going from BUSY to OK
+static void snoop_imager_agent(indigo_client *client, indigo_property *property) {
+	indigo_device *device = FILTER_CLIENT_CONTEXT->device;
+	char *related = indigo_filter_first_related_agent(device, IMAGER_AGENT_PREFIX);
+	if (related == NULL || strcmp(related, property->device)) {
+		return;
+	}
+	if (!strcmp(property->name, CCD_EXPOSURE_PROPERTY_NAME)) {
+		if (CLIENT_PRIVATE_DATA->imager_exposure_state == INDIGO_BUSY_STATE && property->state == INDIGO_OK_STATE) {
+			CLIENT_PRIVATE_DATA->imager_exposures++;
+		}
+		CLIENT_PRIVATE_DATA->imager_exposure_state = property->state;
+	} else if (!strcmp(property->name, AGENT_START_PROCESS_PROPERTY_NAME)) {
+		CLIENT_PRIVATE_DATA->imager_start_state = property->state;
+	}
+}
+
 // the properties of the selected devices come from the agent itself, with the names it publishes
 static void snoop_changes(indigo_client *client, indigo_device *device, indigo_property *property) {
 	if (!strcmp(property->name, AO_GUIDE_RA_PROPERTY_NAME)) {
@@ -1146,7 +1236,7 @@ static void snoop_info(indigo_client *client, indigo_property *property) {
 // -------------------------------------------------------------------------------- INDIGO agent device implementation
 
 static bool validate_related_agent(indigo_device *device, indigo_property *info_property, int mask) {
-	return !strncmp(info_property->device, GUIDER_AGENT_PREFIX, strlen(GUIDER_AGENT_PREFIX));
+	return !strncmp(info_property->device, GUIDER_AGENT_PREFIX, strlen(GUIDER_AGENT_PREFIX)) || !strncmp(info_property->device, IMAGER_AGENT_PREFIX, strlen(IMAGER_AGENT_PREFIX));
 }
 
 static indigo_result agent_enumerate_properties(indigo_device *device, indigo_client *client, indigo_property *property);
@@ -1387,6 +1477,7 @@ static indigo_result agent_define_property(indigo_client *client, indigo_device 
 		}
 	} else {
 		snoop_guider_agent(client, property);
+		snoop_imager_agent(client, property);
 	}
 	return indigo_filter_define_property(client, device, property, message);
 }
@@ -1400,6 +1491,7 @@ static indigo_result agent_update_property(indigo_client *client, indigo_device 
 		}
 	} else {
 		snoop_guider_agent(client, property);
+		snoop_imager_agent(client, property);
 	}
 	return indigo_filter_update_property(client, device, property, message);
 }
