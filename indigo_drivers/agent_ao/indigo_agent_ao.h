@@ -53,10 +53,8 @@ extern "C" {
 #define AGENT_AO_MODE_RELATIVE_ITEM_NAME				"RELATIVE"
 #define AGENT_AO_MODE_ABSOLUTE_ITEM_NAME				"ABSOLUTE"
 
-// How the slow part of the AO deflection is passed to the mount
+// Whether the slow part of the AO deflection is passed to the mount with guide pulses
 #define AGENT_AO_BUMP_MODE_PROPERTY_NAME				"AGENT_AO_BUMP_MODE"
-#define AGENT_AO_BUMP_MODE_AUTO_ITEM_NAME				"AUTO"
-#define AGENT_AO_BUMP_MODE_GUIDER_AGENT_ITEM_NAME	"GUIDER_AGENT"
 #define AGENT_AO_BUMP_MODE_DIRECT_ITEM_NAME			"DIRECT"
 #define AGENT_AO_BUMP_MODE_OFF_ITEM_NAME				"OFF"
 
@@ -81,11 +79,6 @@ extern "C" {
 #define AGENT_AO_PHASE_CENTERING								5
 #define AGENT_AO_PHASE_FAILED										6
 #define AGENT_AO_PHASE_DONE											7
-
-// Active back-end of the mount bump, AGENT_AO_STATS.BUMP_BACKEND
-#define AGENT_AO_BACKEND_NONE										0
-#define AGENT_AO_BACKEND_GUIDER_AGENT						1
-#define AGENT_AO_BACKEND_DIRECT									2
 
 /** Create AO agent instance
  */

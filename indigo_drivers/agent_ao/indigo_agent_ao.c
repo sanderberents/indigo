@@ -23,9 +23,8 @@
  camera (CCD_STREAMING, a series of single exposures as a fallback) and the AO is moved to reduce the star displacement d (gain GAIN per frame, dead-band MIN_MOVE),
  which makes a closed loop: the AO deflection a (in OAG pixels) is part of the star position the camera sees. The slow
  part of the deflection is handed over to the mount, "bumped", so that the AO relaxes to its centre: the total mount
- displacement T integrates a with a long time constant, and is realised either through the Guider Agent
- (AGENT_GUIDER_TARGET_OFFSET, while the Guider Agent is guiding) or by slow, rare pulses to a guide port selected in
- this agent. At most one of them moves the mount at any time.
+ displacement T integrates a with a long time constant, and is realised by slow, rare pulses to a guide port selected in
+ this agent. While a related Guider Agent is busy, this agent never moves the mount and pauses the loop while it dithers.
 
  Conventions: all vectors are star displacements in the pixels of the OAG frame. The RA axis is the direction in which
  the star moves when the mount is pulsed west, positive Dec is the direction of a north pulse. An AO axis is positive
@@ -54,7 +53,6 @@
 #define FRAME_TIMEOUT 3.0
 #define STATS_PERIOD 0.5
 #define GUIDER_AGENT_PREFIX "Guider Agent"
-#define MAX_TARGET_ARCSEC 100.0
 
 #define DEVICE_PRIVATE_DATA ((ao_agent_private_data *)device->private_data)
 #define CLIENT_PRIVATE_DATA ((ao_agent_private_data *)FILTER_CLIENT_CONTEXT->device->private_data)
@@ -154,7 +152,7 @@ enum {
 	T_OFFSET_Y,
 	T_BUMP_RA_S,
 	T_BUMP_DEC_S,
-	T_BACKEND,
+	T_BUMP_ACTIVE,
 	T_SATURATED,
 	T_LOST,
 	T_COUNT
@@ -174,7 +172,7 @@ static const setting_definition stats_definitions[T_COUNT] = {
 	{ "OFFSET_Y", "AO deflection Y (px)", -10000, 10000, 0, 0 },
 	{ "BUMP_RA_S", "Mount bump RA (arcsec)", -100000, 100000, 0, 0 },
 	{ "BUMP_DEC_S", "Mount bump Dec (arcsec)", -100000, 100000, 0, 0 },
-	{ "BUMP_BACKEND", "Bump back-end", 0, 2, 0, 0 },
+	{ "BUMP_ACTIVE", "Mount bump active", 0, 1, 0, 0 },
 	{ "SATURATED", "AO at its limit", 0, 1, 0, 0 },
 	{ "LOST_FRAMES", "Frames without star", 0, 1000000, 0, 0 }
 };
@@ -226,20 +224,14 @@ typedef struct {
 	double mount_dec;
 	int mount_sop;
 	volatile bool mount_slewing;
-	volatile int guider_phase;
-	volatile int guider_frame;
 	volatile double guider_dithering;
 	volatile indigo_property_state guider_start_state;
 	volatile indigo_property_state guider_dither_state;
-	volatile double guider_target_ra, guider_target_dec;
-	int backend;
+	bool bump_active;
 	double bump_x, bump_y;
-	double base_x, base_y;
 	double done_x, done_y;
 	double bump_time;
 	double bump_pulse_time;
-	double sent_ra, sent_dec;
-	double write_time;
 	int process;
 	pthread_mutex_t mutex;
 } ao_agent_private_data;
@@ -256,10 +248,8 @@ typedef struct {
 #define AGENT_AO_MODE_RELATIVE_ITEM						(AGENT_AO_MODE_PROPERTY->items + 0)
 #define AGENT_AO_MODE_ABSOLUTE_ITEM						(AGENT_AO_MODE_PROPERTY->items + 1)
 #define AGENT_AO_BUMP_MODE_PROPERTY						(DEVICE_PRIVATE_DATA->bump_mode_property)
-#define AGENT_AO_BUMP_MODE_AUTO_ITEM					(AGENT_AO_BUMP_MODE_PROPERTY->items + 0)
-#define AGENT_AO_BUMP_MODE_GUIDER_AGENT_ITEM	(AGENT_AO_BUMP_MODE_PROPERTY->items + 1)
-#define AGENT_AO_BUMP_MODE_DIRECT_ITEM				(AGENT_AO_BUMP_MODE_PROPERTY->items + 2)
-#define AGENT_AO_BUMP_MODE_OFF_ITEM						(AGENT_AO_BUMP_MODE_PROPERTY->items + 3)
+#define AGENT_AO_BUMP_MODE_DIRECT_ITEM				(AGENT_AO_BUMP_MODE_PROPERTY->items + 0)
+#define AGENT_AO_BUMP_MODE_OFF_ITEM						(AGENT_AO_BUMP_MODE_PROPERTY->items + 1)
 #define AGENT_AO_DEC_MODE_PROPERTY						(DEVICE_PRIVATE_DATA->dec_mode_property)
 #define AGENT_AO_DEC_MODE_BOTH_ITEM						(AGENT_AO_DEC_MODE_PROPERTY->items + 0)
 #define AGENT_AO_DEC_MODE_NORTH_ITEM					(AGENT_AO_DEC_MODE_PROPERTY->items + 1)
@@ -313,7 +303,7 @@ static void update_stats(indigo_device *device) {
 	STAT(T_POSITION_DEC) = round(1000 * DEVICE_PRIVATE_DATA->pos_dec) / 1000;
 	STAT(T_SATURATED) = DEVICE_PRIVATE_DATA->saturated ? 1 : 0;
 	STAT(T_LOST) = DEVICE_PRIVATE_DATA->lost_frames;
-	STAT(T_BACKEND) = DEVICE_PRIVATE_DATA->backend;
+	STAT(T_BUMP_ACTIVE) = DEVICE_PRIVATE_DATA->bump_active ? 1 : 0;
 	indigo_update_property(device, AGENT_AO_STATS_PROPERTY, NULL);
 }
 
@@ -700,98 +690,34 @@ static bool guider_agent_name(indigo_device *device, char *name) {
 
 // -------------------------------------------------------------------------------- bump
 
-static bool guider_agent_guiding(indigo_device *device) {
-	char name[INDIGO_NAME_SIZE];
-	return guider_agent_name(device, name) && DEVICE_PRIVATE_DATA->guider_start_state == INDIGO_BUSY_STATE && DEVICE_PRIVATE_DATA->guider_phase == INDIGO_GUIDER_PHASE_GUIDING && DEVICE_PRIVATE_DATA->guider_frame > 5;
-}
-
 static bool guider_agent_busy(indigo_device *device) {
 	char name[INDIGO_NAME_SIZE];
 	return guider_agent_name(device, name) && DEVICE_PRIVATE_DATA->guider_start_state == INDIGO_BUSY_STATE;
 }
 
 // The Guider Agent is the only one to move the mount while it calibrates, previews or guides
-static int select_backend(indigo_device *device) {
+static bool bump_wanted(indigo_device *device) {
 	if (AGENT_AO_BUMP_MODE_OFF_ITEM->sw.value || !mount_calibrated(device) || DEVICE_PRIVATE_DATA->mount_slewing) {
-		return AGENT_AO_BACKEND_NONE;
+		return false;
 	}
-	bool guiding = guider_agent_guiding(device);
-	bool busy = guider_agent_busy(device);
-	if (AGENT_AO_BUMP_MODE_GUIDER_AGENT_ITEM->sw.value) {
-		return guiding && get_pixel_scale(device) > 0 ? AGENT_AO_BACKEND_GUIDER_AGENT : AGENT_AO_BACKEND_NONE;
-	}
-	if (AGENT_AO_BUMP_MODE_DIRECT_ITEM->sw.value) {
-		return !busy && INDIGO_FILTER_GUIDER_SELECTED ? AGENT_AO_BACKEND_DIRECT : AGENT_AO_BACKEND_NONE;
-	}
-	if (guiding && get_pixel_scale(device) > 0) {
-		return AGENT_AO_BACKEND_GUIDER_AGENT;
-	}
-	return !busy && INDIGO_FILTER_GUIDER_SELECTED ? AGENT_AO_BACKEND_DIRECT : AGENT_AO_BACKEND_NONE;
-}
-
-static void write_guider_target(indigo_device *device, double ra, double dec) {
-	char name[INDIGO_NAME_SIZE];
-	if (!guider_agent_name(device, name)) {
-		return;
-	}
-	static const char *names[] = { AGENT_GUIDER_TARGET_OFFSET_RA_ITEM_NAME, AGENT_GUIDER_TARGET_OFFSET_DEC_ITEM_NAME };
-	double values[] = { ra, dec };
-	indigo_change_number_property(FILTER_DEVICE_CONTEXT->client, name, AGENT_GUIDER_TARGET_OFFSET_PROPERTY_NAME, 2, names, values);
-	DEVICE_PRIVATE_DATA->sent_ra = ra;
-	DEVICE_PRIVATE_DATA->sent_dec = dec;
-	DEVICE_PRIVATE_DATA->write_time = indigo_monotonic_time();
-}
-
-// The Guider Agent starts over with a zero offset and a new reference: the part of the bump it realised is the new baseline
-static void rebase_guider(indigo_device *device) {
-	double scale = get_pixel_scale(device);
-	if (scale > 0 && (DEVICE_PRIVATE_DATA->sent_ra != 0 || DEVICE_PRIVATE_DATA->sent_dec != 0)) {
-		double x, y;
-		sky_to_px(device, DEVICE_PRIVATE_DATA->sent_ra / scale, DEVICE_PRIVATE_DATA->sent_dec / scale, &x, &y);
-		DEVICE_PRIVATE_DATA->base_x += x;
-		DEVICE_PRIVATE_DATA->base_y += y;
-	}
-	DEVICE_PRIVATE_DATA->sent_ra = DEVICE_PRIVATE_DATA->sent_dec = 0;
-	DEVICE_PRIVATE_DATA->guider_target_ra = DEVICE_PRIVATE_DATA->guider_target_dec = 0;
+	return !guider_agent_busy(device) && INDIGO_FILTER_GUIDER_SELECTED;
 }
 
 static void bump_reset(indigo_device *device) {
 	DEVICE_PRIVATE_DATA->bump_x = DEVICE_PRIVATE_DATA->bump_y = 0;
-	DEVICE_PRIVATE_DATA->base_x = DEVICE_PRIVATE_DATA->base_y = 0;
 	DEVICE_PRIVATE_DATA->done_x = DEVICE_PRIVATE_DATA->done_y = 0;
-	DEVICE_PRIVATE_DATA->sent_ra = DEVICE_PRIVATE_DATA->sent_dec = 0;
 	DEVICE_PRIVATE_DATA->bump_time = 0;
-	if (DEVICE_PRIVATE_DATA->backend == AGENT_AO_BACKEND_GUIDER_AGENT) {
-		write_guider_target(device, 0, 0);
-	}
 	STAT(T_BUMP_RA_S) = STAT(T_BUMP_DEC_S) = 0;
 }
 
-static void handover(indigo_device *device, int backend) {
-	int previous = DEVICE_PRIVATE_DATA->backend;
-	if (previous == AGENT_AO_BACKEND_GUIDER_AGENT) {
-		// the mount stays where the Guider Agent moved it
-		DEVICE_PRIVATE_DATA->done_x = DEVICE_PRIVATE_DATA->bump_x;
-		DEVICE_PRIVATE_DATA->done_y = DEVICE_PRIVATE_DATA->bump_y;
-		write_guider_target(device, 0, 0);
-	}
-	if (backend == AGENT_AO_BACKEND_GUIDER_AGENT) {
-		// what the direct pulses moved is part of the new reference of the Guider Agent
-		DEVICE_PRIVATE_DATA->base_x = DEVICE_PRIVATE_DATA->done_x;
-		DEVICE_PRIVATE_DATA->base_y = DEVICE_PRIVATE_DATA->done_y;
-		DEVICE_PRIVATE_DATA->sent_ra = DEVICE_PRIVATE_DATA->sent_dec = 0;
-	}
-	DEVICE_PRIVATE_DATA->backend = backend;
-	indigo_send_message(device, IDLE_PROPERTY, backend == AGENT_AO_BACKEND_GUIDER_AGENT ? "Mount bump goes through the Guider Agent" : (backend == AGENT_AO_BACKEND_DIRECT ? "Mount bump sends guide pulses" : "Mount bump is off"));
-}
-
-// One step of the slow loop: the total displacement T integrates the deflection of the AO and is realised by the active back-end
+// One step of the slow loop: the total displacement T integrates the deflection of the AO and is realised by guide pulses
 static void bump_step(indigo_device *device, double dt) {
-	int backend = select_backend(device);
-	if (backend != DEVICE_PRIVATE_DATA->backend) {
-		handover(device, backend);
+	bool active = bump_wanted(device);
+	if (active != DEVICE_PRIVATE_DATA->bump_active) {
+		DEVICE_PRIVATE_DATA->bump_active = active;
+		indigo_send_message(device, IDLE_PROPERTY, active ? "Mount bump sends guide pulses" : "Mount bump is off");
 	}
-	if (backend == AGENT_AO_BACKEND_NONE) {
+	if (!active) {
 		return;
 	}
 	double a_x, a_y;
@@ -800,24 +726,6 @@ static void bump_step(indigo_device *device, double dt) {
 	DEVICE_PRIVATE_DATA->bump_x += a_x * factor;
 	DEVICE_PRIVATE_DATA->bump_y += a_y * factor;
 	double now = indigo_monotonic_time();
-	if (backend == AGENT_AO_BACKEND_GUIDER_AGENT) {
-		double scale = get_pixel_scale(device);
-		double ra, dec;
-		px_to_sky(device, DEVICE_PRIVATE_DATA->bump_x - DEVICE_PRIVATE_DATA->base_x, DEVICE_PRIVATE_DATA->bump_y - DEVICE_PRIVATE_DATA->base_y, &ra, &dec);
-		ra = limit_to(ra * scale, MAX_TARGET_ARCSEC);
-		dec = limit_to(dec * scale, MAX_TARGET_ARCSEC);
-		STAT(T_BUMP_RA_S) = round(1000 * ra) / 1000;
-		STAT(T_BUMP_DEC_S) = round(1000 * dec) / 1000;
-		// the Guider Agent zeroes the offset when it takes a new reference
-		if (DEVICE_PRIVATE_DATA->write_time > 0 && now - DEVICE_PRIVATE_DATA->write_time > 1 && (fabs(DEVICE_PRIVATE_DATA->guider_target_ra - DEVICE_PRIVATE_DATA->sent_ra) > 0.05 || fabs(DEVICE_PRIVATE_DATA->guider_target_dec - DEVICE_PRIVATE_DATA->sent_dec) > 0.05)) {
-			rebase_guider(device);
-			return;
-		}
-		if (now - DEVICE_PRIVATE_DATA->write_time >= 0.5 && (fabs(ra - DEVICE_PRIVATE_DATA->sent_ra) > 0.02 || fabs(dec - DEVICE_PRIVATE_DATA->sent_dec) > 0.02)) {
-			write_guider_target(device, ra, dec);
-		}
-		return;
-	}
 	double ra_px, dec_px;
 	px_to_sky(device, DEVICE_PRIVATE_DATA->bump_x - DEVICE_PRIVATE_DATA->done_x, DEVICE_PRIVATE_DATA->bump_y - DEVICE_PRIVATE_DATA->done_y, &ra_px, &dec_px);
 	STAT(T_BUMP_RA_S) = round(1000 * ra_px * get_pixel_scale(device)) / 1000;
@@ -1072,7 +980,7 @@ static void tracking_process(indigo_device *device) {
 	}
 	ok = ok && start_frames(device) && ao_center(device);
 	bump_reset(device);
-	DEVICE_PRIVATE_DATA->backend = AGENT_AO_BACKEND_NONE;
+	DEVICE_PRIVATE_DATA->bump_active = false;
 	bool frozen = false;
 	double last_time = indigo_monotonic_time();
 	DEVICE_PRIVATE_DATA->stats_time = last_time;
@@ -1149,10 +1057,7 @@ static void tracking_process(indigo_device *device) {
 			DEVICE_PRIVATE_DATA->rate_frames = 0;
 		}
 	}
-	if (DEVICE_PRIVATE_DATA->backend == AGENT_AO_BACKEND_GUIDER_AGENT) {
-		write_guider_target(device, 0, 0);
-	}
-	DEVICE_PRIVATE_DATA->backend = AGENT_AO_BACKEND_NONE;
+	DEVICE_PRIVATE_DATA->bump_active = false;
 	stop_frames(device);
 	if (INDIGO_FILTER_AO_SELECTED) {
 		ao_center(device);
@@ -1172,11 +1077,7 @@ static void snoop_guider_agent(indigo_client *client, indigo_property *property)
 	if (!strcmp(property->name, AGENT_GUIDER_STATS_PROPERTY_NAME)) {
 		for (int i = 0; i < property->count; i++) {
 			indigo_item *item = property->items + i;
-			if (!strcmp(item->name, AGENT_GUIDER_STATS_PHASE_ITEM_NAME)) {
-				CLIENT_PRIVATE_DATA->guider_phase = (int)item->number.value;
-			} else if (!strcmp(item->name, AGENT_GUIDER_STATS_FRAME_ITEM_NAME)) {
-				CLIENT_PRIVATE_DATA->guider_frame = (int)item->number.value;
-			} else if (!strcmp(item->name, AGENT_GUIDER_STATS_DITHERING_ITEM_NAME)) {
+			if (!strcmp(item->name, AGENT_GUIDER_STATS_DITHERING_ITEM_NAME)) {
 				CLIENT_PRIVATE_DATA->guider_dithering = item->number.value;
 			}
 		}
@@ -1184,15 +1085,6 @@ static void snoop_guider_agent(indigo_client *client, indigo_property *property)
 		CLIENT_PRIVATE_DATA->guider_start_state = property->state;
 	} else if (!strcmp(property->name, AGENT_GUIDER_DITHER_PROPERTY_NAME)) {
 		CLIENT_PRIVATE_DATA->guider_dither_state = property->state;
-	} else if (!strcmp(property->name, AGENT_GUIDER_TARGET_OFFSET_PROPERTY_NAME)) {
-		for (int i = 0; i < property->count; i++) {
-			indigo_item *item = property->items + i;
-			if (!strcmp(item->name, AGENT_GUIDER_TARGET_OFFSET_RA_ITEM_NAME)) {
-				CLIENT_PRIVATE_DATA->guider_target_ra = item->number.value;
-			} else if (!strcmp(item->name, AGENT_GUIDER_TARGET_OFFSET_DEC_ITEM_NAME)) {
-				CLIENT_PRIVATE_DATA->guider_target_dec = item->number.value;
-			}
-		}
 	}
 }
 
@@ -1303,13 +1195,11 @@ static indigo_result agent_device_attach(indigo_device *device) {
 		}
 		indigo_init_switch_item(AGENT_AO_MODE_RELATIVE_ITEM, AGENT_AO_MODE_RELATIVE_ITEM_NAME, "Relative steps", true);
 		indigo_init_switch_item(AGENT_AO_MODE_ABSOLUTE_ITEM, AGENT_AO_MODE_ABSOLUTE_ITEM_NAME, "Absolute percent", false);
-		AGENT_AO_BUMP_MODE_PROPERTY = indigo_init_switch_property(NULL, device->name, AGENT_AO_BUMP_MODE_PROPERTY_NAME, "Agent", "Mount bump", INDIGO_OK_STATE, INDIGO_RW_PERM, INDIGO_ONE_OF_MANY_RULE, 4);
+		AGENT_AO_BUMP_MODE_PROPERTY = indigo_init_switch_property(NULL, device->name, AGENT_AO_BUMP_MODE_PROPERTY_NAME, "Agent", "Mount bump", INDIGO_OK_STATE, INDIGO_RW_PERM, INDIGO_ONE_OF_MANY_RULE, 2);
 		if (AGENT_AO_BUMP_MODE_PROPERTY == NULL) {
 			return INDIGO_FAILED;
 		}
-		indigo_init_switch_item(AGENT_AO_BUMP_MODE_AUTO_ITEM, AGENT_AO_BUMP_MODE_AUTO_ITEM_NAME, "Automatic", true);
-		indigo_init_switch_item(AGENT_AO_BUMP_MODE_GUIDER_AGENT_ITEM, AGENT_AO_BUMP_MODE_GUIDER_AGENT_ITEM_NAME, "Through the Guider Agent", false);
-		indigo_init_switch_item(AGENT_AO_BUMP_MODE_DIRECT_ITEM, AGENT_AO_BUMP_MODE_DIRECT_ITEM_NAME, "Direct guide pulses", false);
+		indigo_init_switch_item(AGENT_AO_BUMP_MODE_DIRECT_ITEM, AGENT_AO_BUMP_MODE_DIRECT_ITEM_NAME, "Direct guide pulses", true);
 		indigo_init_switch_item(AGENT_AO_BUMP_MODE_OFF_ITEM, AGENT_AO_BUMP_MODE_OFF_ITEM_NAME, "Off", false);
 		AGENT_AO_DEC_MODE_PROPERTY = indigo_init_switch_property(NULL, device->name, AGENT_AO_DEC_MODE_PROPERTY_NAME, "Agent", "Dec bump mode", INDIGO_OK_STATE, INDIGO_RW_PERM, INDIGO_ONE_OF_MANY_RULE, 3);
 		if (AGENT_AO_DEC_MODE_PROPERTY == NULL) {
@@ -1325,7 +1215,6 @@ static indigo_result agent_device_attach(indigo_device *device) {
 			return INDIGO_FAILED;
 		}
 		// --------------------------------------------------------------------------------
-		DEVICE_PRIVATE_DATA->guider_phase = INDIGO_GUIDER_PHASE_IGNORE;
 		pthread_mutex_init(&DEVICE_PRIVATE_DATA->mutex, NULL);
 		pthread_mutex_init(&DEVICE_PRIVATE_DATA->frame_mutex, NULL);
 		CONFIG_PROPERTY->hidden = true;

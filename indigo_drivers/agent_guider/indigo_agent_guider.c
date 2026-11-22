@@ -25,7 +25,7 @@
  \file indigo_agent_guider.c
  */
 
-#define DRIVER_VERSION 0x03000038
+#define DRIVER_VERSION 0x03000037
 #define DRIVER_NAME	"indigo_agent_guider"
 
 #include <stdlib.h>
@@ -242,10 +242,6 @@
 #define AGENT_GUIDER_DITHERING_OFFSETS_X_ITEM  		(AGENT_GUIDER_DITHERING_OFFSETS_PROPERTY->items+0)
 #define AGENT_GUIDER_DITHERING_OFFSETS_Y_ITEM  		(AGENT_GUIDER_DITHERING_OFFSETS_PROPERTY->items+1)
 
-#define AGENT_GUIDER_TARGET_OFFSET_PROPERTY		(DEVICE_PRIVATE_DATA->agent_target_offset_property)
-#define AGENT_GUIDER_TARGET_OFFSET_RA_ITEM  		(AGENT_GUIDER_TARGET_OFFSET_PROPERTY->items+0)
-#define AGENT_GUIDER_TARGET_OFFSET_DEC_ITEM  		(AGENT_GUIDER_TARGET_OFFSET_PROPERTY->items+1)
-
 #define AGENT_GUIDER_DITHER_PROPERTY				(DEVICE_PRIVATE_DATA->agent_dither_property)
 #define AGENT_GUIDER_DITHER_TRIGGER_ITEM					(AGENT_GUIDER_DITHER_PROPERTY->items+0)
 #define AGENT_GUIDER_DITHER_RESET_ITEM					(AGENT_GUIDER_DITHER_PROPERTY->items+1)
@@ -306,7 +302,6 @@ typedef struct {
 	indigo_property *agent_stats_property;
 	indigo_property *agent_dithering_strategy_property;
 	indigo_property *agent_dithering_offsets_property;
-	indigo_property *agent_target_offset_property;
 	indigo_property *agent_dither_property;
 	indigo_property *agent_reset_ppec_property;
 	indigo_property *agent_reset_mkgp_property;
@@ -607,34 +602,6 @@ static inline double get_dec_speed(indigo_device *device) {
 		return -AGENT_GUIDER_SETTINGS_SPEED_DEC_ITEM->number.value;
 	}
 	return AGENT_GUIDER_SETTINGS_SPEED_DEC_ITEM->number.value;
-}
-
-/* Pixel scale in arcsec per pixel, 0 if the camera is not known yet */
-static double get_pixel_scale(indigo_device *device) {
-	return 3600 * sqrt(CCD_LENS_FOV_PIXEL_SCALE_WIDTH_ITEM->number.value * CCD_LENS_FOV_PIXEL_SCALE_HEIGHT_ITEM->number.value);
-}
-
-/* The lock position can be shifted by a related agent (AO agent) with AGENT_GUIDER_TARGET_OFFSET, in arcsec on the sky.
-   It is converted to the pixels of the image with the inverse of the rotation into RA/Dec used for the drift; the matrix
-   of that rotation is its own inverse. After a meridian flip the effective angle turns by 180 degrees, so the offset on the sky stays valid. */
-static void get_target_offset_px(indigo_device *device, double *x, double *y) {
-	*x = *y = 0;
-	double ra = AGENT_GUIDER_TARGET_OFFSET_RA_ITEM->number.value;
-	double dec = AGENT_GUIDER_TARGET_OFFSET_DEC_ITEM->number.value;
-	double scale = get_pixel_scale(device);
-	if ((ra == 0 && dec == 0) || !(scale > 0)) {
-		return;
-	}
-	double angle = -PI * get_rotation_angle(device) / 180;
-	*x = (ra * cos(angle) + dec * sin(angle)) / scale;
-	*y = (ra * sin(angle) - dec * cos(angle)) / scale;
-}
-
-static void clear_target_offset(indigo_device *device) {
-	if (AGENT_GUIDER_TARGET_OFFSET_RA_ITEM->number.value != 0 || AGENT_GUIDER_TARGET_OFFSET_DEC_ITEM->number.value != 0) {
-		AGENT_GUIDER_TARGET_OFFSET_RA_ITEM->number.value = AGENT_GUIDER_TARGET_OFFSET_RA_ITEM->number.target = AGENT_GUIDER_TARGET_OFFSET_DEC_ITEM->number.value = AGENT_GUIDER_TARGET_OFFSET_DEC_ITEM->number.target = 0;
-		indigo_update_property(device, AGENT_GUIDER_TARGET_OFFSET_PROPERTY, NULL);
-	}
 }
 
 static void random_dither_values(double amount, double *dither_x, double *dither_y) {
@@ -1188,12 +1155,8 @@ static bool capture_and_process_frame(indigo_device *device) {
 			indigo_send_message(device, BUSY_PROPERTY, "Can't calculate drift");
 			return false;
 		}
-		double target_x = 0, target_y = 0;
-		if ((int)AGENT_GUIDER_STATS_PHASE_ITEM->number.value == INDIGO_GUIDER_PHASE_GUIDING) {
-			get_target_offset_px(device, &target_x, &target_y);
-		}
-		DEVICE_PRIVATE_DATA->drift_x = drift_x - AGENT_GUIDER_DITHERING_OFFSETS_X_ITEM->number.value - target_x;
-		DEVICE_PRIVATE_DATA->drift_y = drift_y - AGENT_GUIDER_DITHERING_OFFSETS_Y_ITEM->number.value - target_y;
+		DEVICE_PRIVATE_DATA->drift_x = drift_x - AGENT_GUIDER_DITHERING_OFFSETS_X_ITEM->number.value;
+		DEVICE_PRIVATE_DATA->drift_y = drift_y - AGENT_GUIDER_DITHERING_OFFSETS_Y_ITEM->number.value;
 		int count = (int)fmin(AGENT_GUIDER_SETTINGS_STACK_ITEM->number.value, DEVICE_PRIVATE_DATA->stack_size);
 		double stddev_x = indigo_stddev(DEVICE_PRIVATE_DATA->stack_x, count);
 		double stddev_y = indigo_stddev(DEVICE_PRIVATE_DATA->stack_y, count);
@@ -1363,7 +1326,6 @@ static void preview_1_process(indigo_device *device) {
 	AGENT_GUIDER_DITHERING_OFFSETS_X_ITEM->number.value = AGENT_GUIDER_DITHERING_OFFSETS_X_ITEM->number.target = AGENT_GUIDER_DITHERING_OFFSETS_Y_ITEM->number.value = AGENT_GUIDER_DITHERING_OFFSETS_Y_ITEM->number.target = 0;
 	indigo_update_property(device, AGENT_GUIDER_STATS_PROPERTY, NULL);
 	indigo_update_property(device, AGENT_GUIDER_DITHERING_OFFSETS_PROPERTY, NULL);
-	clear_target_offset(device);
 	allow_abort_by_mount_agent(device, false);
 	int upload_mode = indigo_save_switch_state(device, CCD_UPLOAD_MODE_PROPERTY_NAME, CCD_UPLOAD_MODE_CLIENT_ITEM_NAME);
 	int image_format = indigo_save_switch_state(device, CCD_IMAGE_FORMAT_PROPERTY_NAME, CCD_IMAGE_FORMAT_RAW_ITEM_NAME);
@@ -1392,7 +1354,6 @@ static void preview_process(indigo_device *device) {
 	AGENT_GUIDER_DITHERING_OFFSETS_X_ITEM->number.value = AGENT_GUIDER_DITHERING_OFFSETS_X_ITEM->number.target = AGENT_GUIDER_DITHERING_OFFSETS_Y_ITEM->number.value = AGENT_GUIDER_DITHERING_OFFSETS_Y_ITEM->number.target = 0;
 	indigo_update_property(device, AGENT_GUIDER_STATS_PROPERTY, NULL);
 	indigo_update_property(device, AGENT_GUIDER_DITHERING_OFFSETS_PROPERTY, NULL);
-	clear_target_offset(device);
 	allow_abort_by_mount_agent(device, false);
 	int upload_mode = indigo_save_switch_state(device, CCD_UPLOAD_MODE_PROPERTY_NAME, CCD_UPLOAD_MODE_CLIENT_ITEM_NAME);
 	int image_format = indigo_save_switch_state(device, CCD_IMAGE_FORMAT_PROPERTY_NAME, CCD_IMAGE_FORMAT_RAW_ITEM_NAME);
@@ -1646,7 +1607,6 @@ static bool calibrate(indigo_device *device) {
 	AGENT_GUIDER_DITHERING_OFFSETS_X_ITEM->number.value = AGENT_GUIDER_DITHERING_OFFSETS_X_ITEM->number.target = AGENT_GUIDER_DITHERING_OFFSETS_Y_ITEM->number.value = AGENT_GUIDER_DITHERING_OFFSETS_Y_ITEM->number.target = 0;
 	indigo_update_property(device, AGENT_GUIDER_STATS_PROPERTY, NULL);
 	indigo_update_property(device, AGENT_GUIDER_DITHERING_OFFSETS_PROPERTY, NULL);
-	clear_target_offset(device);
 	indigo_send_message(device, IDLE_PROPERTY, "Calibration started");
 	allow_abort_by_mount_agent(device, true);
 	if (AGENT_GUIDER_ENABLE_LOGGING_FEATURE_ITEM->sw.value) {
@@ -1672,7 +1632,6 @@ static bool calibrate(indigo_device *device) {
 				AGENT_GUIDER_SETTINGS_ANGLE_ITEM->number.value = AGENT_GUIDER_SETTINGS_ANGLE_ITEM->number.target = AGENT_GUIDER_SETTINGS_SOP_ITEM->number.value = AGENT_GUIDER_SETTINGS_SOP_ITEM->number.target = AGENT_GUIDER_SETTINGS_BACKLASH_ITEM->number.value = AGENT_GUIDER_SETTINGS_BACKLASH_ITEM->number.target = AGENT_GUIDER_SETTINGS_SPEED_RA_ITEM->number.value = AGENT_GUIDER_SETTINGS_SPEED_RA_ITEM->number.target = AGENT_GUIDER_SETTINGS_SPEED_DEC_ITEM->number.value = AGENT_GUIDER_SETTINGS_SPEED_DEC_ITEM->number.target = AGENT_GUIDER_DITHERING_OFFSETS_X_ITEM->number.value = AGENT_GUIDER_DITHERING_OFFSETS_X_ITEM->number.target = AGENT_GUIDER_DITHERING_OFFSETS_Y_ITEM->number.value = AGENT_GUIDER_DITHERING_OFFSETS_Y_ITEM->number.target = 0;
 				indigo_update_property(device, AGENT_GUIDER_SETTINGS_PROPERTY, NULL);
 				indigo_update_property(device, AGENT_GUIDER_DITHERING_OFFSETS_PROPERTY, NULL);
-				clear_target_offset(device);
 				indigo_update_property(device, AGENT_GUIDER_STATS_PROPERTY, "Initializing calibration");
 				DEVICE_PRIVATE_DATA->phase = INDIGO_GUIDER_PHASE_CLEARING_DEC;
 				break;
@@ -1976,7 +1935,6 @@ static bool guide(indigo_device *device) {
 	indigo_update_property(device, AGENT_GUIDER_STATS_PROPERTY, NULL);
 	AGENT_GUIDER_DITHERING_OFFSETS_X_ITEM->number.value = AGENT_GUIDER_DITHERING_OFFSETS_X_ITEM->number.target = AGENT_GUIDER_DITHERING_OFFSETS_Y_ITEM->number.value = AGENT_GUIDER_DITHERING_OFFSETS_Y_ITEM->number.target = 0;
 	indigo_update_property(device, AGENT_GUIDER_DITHERING_OFFSETS_PROPERTY, NULL);
-	clear_target_offset(device);
 	DEVICE_PRIVATE_DATA->rmse_ra_sum = DEVICE_PRIVATE_DATA->rmse_dec_sum = DEVICE_PRIVATE_DATA->rmse_ra_s_sum = DEVICE_PRIVATE_DATA->rmse_dec_s_sum = DEVICE_PRIVATE_DATA->rmse_count = 0;
 	DEVICE_PRIVATE_DATA->corr_resp_count = DEVICE_PRIVATE_DATA->corr_resp_head = 0;
 	DEVICE_PRIVATE_DATA->guide_cycle_time = DEVICE_PRIVATE_DATA->guide_cycle_nominal = 0;
@@ -2023,7 +1981,6 @@ static bool guide(indigo_device *device) {
 				if (DEVICE_PRIVATE_DATA->first_frame) {
 					AGENT_GUIDER_STATS_FRAME_ITEM->number.value = 0;
 					DEVICE_PRIVATE_DATA->first_frame = false;
-					clear_target_offset(device);
 					DEVICE_PRIVATE_DATA->silence_warnings = true;
 					if (!AGENT_GUIDER_DETECTION_DONUTS_ITEM->sw.value) {
 						clear_selection(device);
@@ -2070,7 +2027,6 @@ static bool guide(indigo_device *device) {
 						}
 					}
 					AGENT_GUIDER_STATS_FRAME_ITEM->number.value = 0;
-					clear_target_offset(device);
 				}
 				indigo_update_property(device, AGENT_GUIDER_STATS_PROPERTY, NULL);
 				continue;
@@ -2801,13 +2757,6 @@ static indigo_result agent_device_attach(indigo_device *device) {
 		}
 		indigo_init_number_item(AGENT_GUIDER_DITHERING_OFFSETS_X_ITEM, AGENT_GUIDER_DITHERING_OFFSETS_X_ITEM_NAME, "Offset X (px)", -15, 15, 1, 0);
 		indigo_init_number_item(AGENT_GUIDER_DITHERING_OFFSETS_Y_ITEM, AGENT_GUIDER_DITHERING_OFFSETS_Y_ITEM_NAME, "Offset Y (px)", -15, 15, 1, 0);
-		// -------------------------------------------------------------------------------- Target offset
-		AGENT_GUIDER_TARGET_OFFSET_PROPERTY = indigo_init_number_property(NULL, device->name, AGENT_GUIDER_TARGET_OFFSET_PROPERTY_NAME, "Agent", "Target offset", INDIGO_OK_STATE, INDIGO_RW_PERM, 2);
-		if (AGENT_GUIDER_TARGET_OFFSET_PROPERTY == NULL) {
-			return INDIGO_FAILED;
-		}
-		indigo_init_number_item(AGENT_GUIDER_TARGET_OFFSET_RA_ITEM, AGENT_GUIDER_TARGET_OFFSET_RA_ITEM_NAME, "RA offset (arcsec)", -120, 120, 0, 0);
-		indigo_init_number_item(AGENT_GUIDER_TARGET_OFFSET_DEC_ITEM, AGENT_GUIDER_TARGET_OFFSET_DEC_ITEM_NAME, "Dec offset (arcsec)", -120, 120, 0, 0);
 		// -------------------------------------------------------------------------------- Dithering strategy
 		AGENT_GUIDER_DITHERING_STRATEGY_PROPERTY = indigo_init_switch_property(NULL, device->name, AGENT_GUIDER_DITHERING_STRATEGY_PROPERTY_NAME, "Agent", "Dithering strategy", INDIGO_OK_STATE, INDIGO_RW_PERM, INDIGO_ONE_OF_MANY_RULE, 3);
 		if (AGENT_GUIDER_DITHERING_STRATEGY_PROPERTY == NULL) {
@@ -2866,7 +2815,6 @@ static indigo_result agent_enumerate_properties(indigo_device *device, indigo_cl
 	INDIGO_DEFINE_MATCHING_PROPERTY(AGENT_START_PROCESS_PROPERTY);
 	INDIGO_DEFINE_MATCHING_PROPERTY(AGENT_ABORT_PROCESS_PROPERTY);
 	INDIGO_DEFINE_MATCHING_PROPERTY(AGENT_GUIDER_DITHERING_OFFSETS_PROPERTY);
-	INDIGO_DEFINE_MATCHING_PROPERTY(AGENT_GUIDER_TARGET_OFFSET_PROPERTY);
 	INDIGO_DEFINE_MATCHING_PROPERTY(AGENT_GUIDER_DITHERING_STRATEGY_PROPERTY);
 	INDIGO_DEFINE_MATCHING_PROPERTY(AGENT_GUIDER_DITHER_PROPERTY);
 	INDIGO_DEFINE_MATCHING_PROPERTY(AGENT_GUIDER_RESET_PPEC_PROPERTY);
@@ -3060,19 +3008,6 @@ static indigo_result agent_change_property(indigo_device *device, indigo_client 
 		}
 		AGENT_GUIDER_DITHERING_OFFSETS_PROPERTY->state = INDIGO_OK_STATE;
 		indigo_update_property(device, AGENT_GUIDER_DITHERING_OFFSETS_PROPERTY, NULL);
-		return INDIGO_OK;
-	} else if (indigo_property_match(AGENT_GUIDER_TARGET_OFFSET_PROPERTY, property)) {
-// -------------------------------------------------------------------------------- AGENT_GUIDER_TARGET_OFFSET
-		indigo_property_copy_values(AGENT_GUIDER_TARGET_OFFSET_PROPERTY, property, false);
-		/* A larger step would take the stars out of the selection, the offset is applied at once and followed by the mount through the usual corrections */
-		double limit = 0.8 * AGENT_GUIDER_SELECTION_RADIUS_ITEM->number.value * get_pixel_scale(device);
-		if (limit > 0) {
-			for (int i = 0; i < 2; i++) {
-				AGENT_GUIDER_TARGET_OFFSET_PROPERTY->items[i].number.value = AGENT_GUIDER_TARGET_OFFSET_PROPERTY->items[i].number.target = fmax(-limit, fmin(limit, AGENT_GUIDER_TARGET_OFFSET_PROPERTY->items[i].number.value));
-			}
-		}
-		AGENT_GUIDER_TARGET_OFFSET_PROPERTY->state = INDIGO_OK_STATE;
-		indigo_update_property(device, AGENT_GUIDER_TARGET_OFFSET_PROPERTY, NULL);
 		return INDIGO_OK;
 	} else if (indigo_property_match(AGENT_GUIDER_SETTINGS_PROPERTY, property)) {
 // -------------------------------------------------------------------------------- AGENT_GUIDER_SETTINGS
@@ -3347,7 +3282,6 @@ static indigo_result agent_device_detach(indigo_device *device) {
 	indigo_release_property(AGENT_GUIDER_DEC_MODE_PROPERTY);
 	indigo_release_property(AGENT_GUIDER_APPLY_DEC_BACKLASH_PROPERTY);
 	indigo_release_property(AGENT_GUIDER_DITHERING_OFFSETS_PROPERTY);
-	indigo_release_property(AGENT_GUIDER_TARGET_OFFSET_PROPERTY);
 	indigo_release_property(AGENT_GUIDER_DITHERING_STRATEGY_PROPERTY);
 	indigo_release_property(AGENT_GUIDER_DITHER_PROPERTY);
 	indigo_release_property(AGENT_GUIDER_RESET_PPEC_PROPERTY);

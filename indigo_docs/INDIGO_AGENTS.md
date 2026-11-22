@@ -23,7 +23,7 @@ Agent code contains the most of the application logic for the typical operations
 
 - **Guider Agent** controls guiding cameras and guiding devices. It can calibrate and guide with a different drift detection algorithms, it generates stats and data for different kinds of graphs. The agent name is "*indigo_agent_guider*". The agent's [README.md](https://github.com/indigo-astronomy/indigo/blob/master/indigo_drivers/agent_guider/README.md) contains useful information how to setup your guiding.
 
-- **AO Agent** drives an adaptive optics (AO) device, such as the Starlight Xpress AO or the SBIG AO-7, with the images of an off-axis guide camera behind it. It can calibrate the AO, center it and exercise it, and it passes the slow part of the AO deflection to the mount, through the Guider Agent while it guides or by slow guide pulses of its own. The agent name is "*indigo_agent_ao*".
+- **AO Agent** drives an adaptive optics (AO) device, such as the Starlight Xpress AO or the SBIG AO-7, with the images of an off-axis guide camera behind it. It can calibrate the AO, center it and exercise it, and it passes the slow part of the AO deflection to the mount by slow guide pulses of its own, unless a Guider Agent is guiding. The agent name is "*indigo_agent_ao*".
 
 - **Auxiliary Agent** controls auxiliary devices like power boxes, flat boxes, weather stations, sky quality meters, etc. The agent name is "*indigo_agent_auxiliary*".
 
