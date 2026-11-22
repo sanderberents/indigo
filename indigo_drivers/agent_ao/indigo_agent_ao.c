@@ -73,7 +73,6 @@ enum {
 	S_GAIN,
 	S_MIN_MOVE,
 	S_RANGE,
-	S_MAX_DEFLECTION,
 	S_MAX_STEP,
 	S_CAL_STEP,
 	S_CAL_SETTLE,
@@ -110,8 +109,7 @@ static const setting_definition settings_definitions[S_COUNT] = {
 	{ "SELECTION_RADIUS", "Selection radius (px)", 4, 64, 1, 10 },
 	{ "GAIN", "Loop gain", 0.05, 1, 0, 0.5 },
 	{ "MIN_MOVE", "Minimum move (px)", 0, 5, 0, 0.05 },
-	{ "RANGE", "AO range (steps or %)", 1, 1000, 0, 50 },
-	{ "MAX_DEFLECTION", "Maximum deflection (% of the range)", 1, 100, 0, 100 },
+	{ "RANGE", "Maximum AO deflection (steps or %)", 1, 1000, 0, 50 },
 	{ "MAX_STEP", "Maximum step per request", 1, 1000, 0, 50 },
 	{ "CALIBRATION_STEP", "AO calibration step", 1, 200, 0, 10 },
 	{ "CALIBRATION_SETTLE", "Settle time (s)", 0, 10, 0, 0.5 },
@@ -287,7 +285,7 @@ static inline double limit_to(double value, double limit) {
 
 // The deflection of the AO (the distance of its position from the centre, in steps or percent) is limited to keep the tilt of the optics under control
 static inline double deflection_limit(indigo_device *device) {
-	return SET(S_RANGE) * SET(S_MAX_DEFLECTION) / 100;
+	return SET(S_RANGE);
 }
 
 static void save_config(indigo_device *device) {
