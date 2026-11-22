@@ -1030,7 +1030,7 @@ static void imager_ccd_temperature_callback(indigo_device *device) {
 	if (!CONNECTION_CONNECTED_ITEM->sw.value) {
 		return;
 	}
-	if (!PRIVATE_DATA->imager_no_check_temperature && !PRIVATE_DATA->guider_no_check_temperature) {
+	if (!PRIVATE_DATA->imager_no_check_temperature || !PRIVATE_DATA->guider_no_check_temperature) {
 		if (sbig_set_cooler(device, PRIVATE_DATA->target_temperature, &PRIVATE_DATA->current_temperature, &PRIVATE_DATA->cooler_power)) {
 			double diff = PRIVATE_DATA->current_temperature - PRIVATE_DATA->target_temperature;
 			if (CCD_COOLER_ON_ITEM->sw.value) {
@@ -1062,7 +1062,7 @@ static void guider_ccd_temperature_callback(indigo_device *device) {
 	if (!CONNECTION_CONNECTED_ITEM->sw.value) {
 		return;
 	}
-	if (!PRIVATE_DATA->imager_no_check_temperature && !PRIVATE_DATA->guider_no_check_temperature) {
+	if (!PRIVATE_DATA->imager_no_check_temperature || !PRIVATE_DATA->guider_no_check_temperature) {
 		pthread_mutex_lock(&driver_mutex);
 
 		int res = set_sbig_handle(PRIVATE_DATA->driver_handle);
@@ -1381,7 +1381,6 @@ static void ccd_connect_callback(indigo_device *device) {
 						INDIGO_DRIVER_ERROR(DRIVER_NAME, "sbig_get_temperature() = %d (%s)", res, sbig_error_string(res));
 					}
 
-					PRIVATE_DATA->target_temperature = CCD_TEMPERATURE_ITEM->number.value;
 					PRIVATE_DATA->guider_no_check_temperature = false;
 
 					CCD_COOLER_POWER_PROPERTY->hidden = true;
@@ -2276,7 +2275,6 @@ static void ao_connect_callback(indigo_device *device) {
 	if (CONNECTION_CONNECTED_ITEM->sw.value) {
 		if (!DEVICE_CONNECTED) {
 			if (sbig_open(device)) {
-				PRIVATE_DATA->ao_x_deflection = PRIVATE_DATA->ao_y_deflection = 0;
 				CONNECTION_PROPERTY->state = INDIGO_OK_STATE;
 				set_connected_flag(device);
 			} else {
