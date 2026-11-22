@@ -434,6 +434,23 @@ static ushort sbig_clear_relays(short handle, ushort relays) {
 }
 
 
+#define SBIG_LOCK_TIMEOUT          -1
+#define AO_LOCK_WAIT_STEPS         50    /* 50 * 2 ms = 100 ms */
+
+/* AO commands must not stall behind a long camera operation (readout, cooler or exposure handling), so they wait for
+   driver_mutex for a short time only and fail instead of blocking the caller and every other waiter in the queue. */
+static bool sbig_ao_lock(const char *command) {
+	for (int i = 0; i < AO_LOCK_WAIT_STEPS; i++) {
+		if (pthread_mutex_trylock(&driver_mutex) == 0) {
+			return true;
+		}
+		indigo_usleep(2000);
+	}
+	INDIGO_DRIVER_ERROR(DRIVER_NAME, "%s skipped, the camera is busy", command);
+	return false;
+}
+
+
 /* The SBIG driver library keeps one "current" handle per process and is not re-entrant, so every command must be sent
    with driver_mutex held and with the handle of the camera selected under that same lock. */
 static int sbig_ao_tip_tilt(indigo_device *device, double x_deflection, double y_deflection) {
@@ -445,7 +462,9 @@ static int sbig_ao_tip_tilt(indigo_device *device, double x_deflection, double y
 		.xDeflection = round(fmin(4095.0, (1.0 + x_deflection) * 2048.0)),
 		.yDeflection = round(fmin(4095.0, (1.0 + y_deflection) * 2048.0))
 	};
-	pthread_mutex_lock(&driver_mutex);
+	if (!sbig_ao_lock("CC_AO_TIP_TILT")) {
+		return SBIG_LOCK_TIMEOUT;
+	}
 	res = set_sbig_handle(PRIVATE_DATA->driver_handle);
 	if (res != CE_NO_ERROR) {
 		INDIGO_DRIVER_ERROR(DRIVER_NAME, "set_sbig_handle(%d) = %d (%s)", PRIVATE_DATA->driver_handle, res, sbig_error_string(res));
@@ -474,7 +493,9 @@ static int sbig_ao_center_selected() {
 
 static int sbig_ao_center(indigo_device *device) {
 	int res;
-	pthread_mutex_lock(&driver_mutex);
+	if (!sbig_ao_lock("CC_AO_CENTER")) {
+		return SBIG_LOCK_TIMEOUT;
+	}
 	res = set_sbig_handle(PRIVATE_DATA->driver_handle);
 	if (res != CE_NO_ERROR) {
 		INDIGO_DRIVER_ERROR(DRIVER_NAME, "set_sbig_handle(%d) = %d (%s)", PRIVATE_DATA->driver_handle, res, sbig_error_string(res));
