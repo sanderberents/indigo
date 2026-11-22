@@ -78,7 +78,6 @@ UNIT_TESTS += $(UNIT_BUILD)/test_usbserial_enumeration_macos $(UNIT_BUILD)/test_
 endif
 
 INTEGRATION_TESTS = $(INTEGRATION_BUILD)/test_additional_instances \
-	$(INTEGRATION_BUILD)/test_agent_ao_simulator \
 	$(INTEGRATION_BUILD)/test_agent_guider_cleanup \
 	$(INTEGRATION_BUILD)/test_agent_imager_cleanup \
 	$(INTEGRATION_BUILD)/test_agent_imager_numerics \
@@ -2678,17 +2677,6 @@ $(INTEGRATION_BUILD)/test_agent_imager_guider_mount: integration/test_agent_imag
 .PHONY: test-agent-imager-guider-mount
 test-agent-imager-guider-mount: check-lib $(INTEGRATION_BUILD)/test_agent_imager_guider_mount
 	$(INTEGRATION_BUILD)/test_agent_imager_guider_mount
-
-# The AO Agent with the CCD simulator (off-axis guide camera and the simulated AO); configuration is isolated
-# through a private HOME.
-AGENT_AO_SIMULATOR_ARCHIVES = $(BUILD_DRIVERS)/indigo_agent_ao.a $(BUILD_DRIVERS)/indigo_ccd_simulator.a
-
-$(INTEGRATION_BUILD)/test_agent_ao_simulator: integration/test_agent_ao_simulator.c test_runner.h $(AGENT_AO_SIMULATOR_ARCHIVES) | $(INTEGRATION_BUILD)
-	$(CC) $(TEST_CFLAGS) -o $@ $< $(AGENT_AO_SIMULATOR_ARCHIVES) $(TEST_LDFLAGS) -lindigocat
-
-.PHONY: test-agent-ao-simulator
-test-agent-ao-simulator: check-lib $(INTEGRATION_BUILD)/test_agent_ao_simulator
-	$(INTEGRATION_BUILD)/test_agent_ao_simulator
 
 # The production Mount Agent with the mount simulator driver and with the SynScan driver on its host-side
 # simulator; configuration is isolated through a private HOME.

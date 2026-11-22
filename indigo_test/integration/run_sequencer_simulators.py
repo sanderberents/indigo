@@ -201,7 +201,7 @@ def main():
 	# Native JSON token parsing uses signed strtol; stay in its positive range.
 	token = format(secrets.randbits(31) | 1, "x")
 	acl = home / "test.acl"
-	protected = ["Server", "Scripting Agent", "Configuration Agent", "Imager Agent", "Mount Agent", "Guider Agent", "Platesolver Agent", "CCD Imager Simulator", "CCD Guider Simulator", "CCD Bahtinov Mask Simulator", "DSLR Simulator", "CCD File Simulator", "CCD Imager Simulator (wheel)", "CCD Imager Simulator (focuser)", "CCD Guider Simulator (guider)", "CCD Guider Simulator (AO)", "CCD OAG Simulator", "Mount Simulator", "Mount Simulator (guider)", "Dome Simulator", "GPS Simulator", "Field Rotator Simulator", "PowerBox Simulator", "Weather Station Simulator", "SQM Simulator", "Flat Panel Simulator"]
+	protected = ["Server", "Scripting Agent", "Configuration Agent", "Imager Agent", "Mount Agent", "Guider Agent", "Platesolver Agent", "CCD Imager Simulator", "CCD Guider Simulator", "CCD Bahtinov Mask Simulator", "DSLR Simulator", "CCD File Simulator", "CCD Imager Simulator (wheel)", "CCD Imager Simulator (focuser)", "CCD Guider Simulator (guider)", "CCD Guider Simulator (AO)", "Mount Simulator", "Mount Simulator (guider)", "Dome Simulator", "GPS Simulator", "Field Rotator Simulator", "PowerBox Simulator", "Weather Station Simulator", "SQM Simulator", "Flat Panel Simulator"]
 	# A nonzero master is required as well as per-device ACLs by the native bus.
 	acl.write_text(token + " @\n" + "".join(token + " " + name + "\n" for name in protected))
 	acl.chmod(0o600)

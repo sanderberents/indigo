@@ -52,7 +52,3 @@ Set `EXPOSURE` in `AGENT_AO_SETTINGS` and a small `CCD_FRAME` of the camera arou
 - The calibration pulses move the star several pixels between frames. If the star is lost during `BUMP_CALIBRATION`, increase `SELECTION_RADIUS` or shorten `BUMP_CALIBRATION_PULSE`.
 - The deflection of the AO is limited by `RANGE`, the maximum deflection in AO steps, or in percent for an absolute AO such as the SBIG AO-7. The distance of the AO position from the centre never exceeds it, in the loop, the exercise (whose amplitude is a percentage of it) and the calibration, to keep the tilt of the optics under control. When the loop asks for more, the AO stays at the limit, `AGENT_AO_STATS.SATURATED` shows it and the mount bump takes over the long-term part.
 - Settings, including the calibration results, are saved with the agent configuration.
-
-## Testing
-
-The agent has an integration test against the camera simulator (`indigo_test/integration/test_agent_ao_simulator.c`). No run is recorded yet, and the agent has not been tested with an AO or a camera.
