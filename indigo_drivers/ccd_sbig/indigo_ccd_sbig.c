@@ -434,26 +434,9 @@ static ushort sbig_clear_relays(short handle, ushort relays) {
 }
 
 
-#define SBIG_LOCK_TIMEOUT          -1
-#define AO_LOCK_WAIT_STEPS         50    /* 50 * 2 ms = 100 ms */
-
-/* AO commands must not stall behind a long camera operation (readout, cooler or exposure handling), so they wait for
-   driver_mutex for a short time only and fail instead of blocking the caller and every other waiter in the queue. */
-static bool sbig_ao_lock(const char *command) {
-	for (int i = 0; i < AO_LOCK_WAIT_STEPS; i++) {
-		if (pthread_mutex_trylock(&driver_mutex) == 0) {
-			return true;
-		}
-		indigo_usleep(2000);
-	}
-	INDIGO_DRIVER_ERROR(DRIVER_NAME, "%s skipped, the camera is busy", command);
-	return false;
-}
-
-
-/* The SBIG driver library keeps one "current" handle per process and is not re-entrant, so every command must be sent
-   with driver_mutex held and with the handle of the camera selected under that same lock. */
-static int sbig_ao_tip_tilt(indigo_device *device, double x_deflection, double y_deflection) {
+/* AO commands are sent without driver_mutex on purpose: the AO unit is a separate device and its commands must neither
+   wait for nor block the camera operations (exposure, readout, cooler), and they must stay possible while those run. */
+static int sbig_ao_tip_tilt(double x_deflection, double y_deflection) {
 	assert(fabs(x_deflection) <= 1.0);
 	assert(fabs(y_deflection) <= 1.0);
 
@@ -462,48 +445,20 @@ static int sbig_ao_tip_tilt(indigo_device *device, double x_deflection, double y
 		.xDeflection = round(fmin(4095.0, (1.0 + x_deflection) * 2048.0)),
 		.yDeflection = round(fmin(4095.0, (1.0 + y_deflection) * 2048.0))
 	};
-	if (!sbig_ao_lock("CC_AO_TIP_TILT")) {
-		return SBIG_LOCK_TIMEOUT;
-	}
-	res = set_sbig_handle(PRIVATE_DATA->driver_handle);
-	if (res != CE_NO_ERROR) {
-		INDIGO_DRIVER_ERROR(DRIVER_NAME, "set_sbig_handle(%d) = %d (%s)", PRIVATE_DATA->driver_handle, res, sbig_error_string(res));
-		pthread_mutex_unlock(&driver_mutex);
-		return res;
-	}
 	res = sbig_command(CC_AO_TIP_TILT, &aottp, NULL);
 	if (res != CE_NO_ERROR) {
 		INDIGO_DRIVER_ERROR(DRIVER_NAME, "CC_AO_TIP_TILT error = %d (%s)", res, sbig_error_string(res));
 	}
-	pthread_mutex_unlock(&driver_mutex);
 	return res;
 }
 
 
-/* Sends CC_AO_CENTER to the currently selected handle, the caller owns driver_mutex and the handle selection */
-static int sbig_ao_center_selected() {
+static int sbig_ao_center() {
 	int res;
 	res = sbig_command(CC_AO_CENTER, NULL, NULL);
 	if (res != CE_NO_ERROR) {
 		INDIGO_DRIVER_ERROR(DRIVER_NAME, "CC_AO_CENTER error = %d (%s)", res, sbig_error_string(res));
 	}
-	return res;
-}
-
-
-static int sbig_ao_center(indigo_device *device) {
-	int res;
-	if (!sbig_ao_lock("CC_AO_CENTER")) {
-		return SBIG_LOCK_TIMEOUT;
-	}
-	res = set_sbig_handle(PRIVATE_DATA->driver_handle);
-	if (res != CE_NO_ERROR) {
-		INDIGO_DRIVER_ERROR(DRIVER_NAME, "set_sbig_handle(%d) = %d (%s)", PRIVATE_DATA->driver_handle, res, sbig_error_string(res));
-		pthread_mutex_unlock(&driver_mutex);
-		return res;
-	}
-	res = sbig_ao_center_selected();
-	pthread_mutex_unlock(&driver_mutex);
 	return res;
 }
 
@@ -2335,13 +2290,13 @@ static indigo_result ao_change_property(indigo_device *device, indigo_client *cl
 		indigo_property_copy_values(AO_GUIDE_DEC_PROPERTY, property, false);
 		if (AO_GUIDE_NORTH_ITEM->number.value > 0) {
 			PRIVATE_DATA->ao_y_deflection = AO_GUIDE_NORTH_ITEM->number.value / 100.0;
-			res = sbig_ao_tip_tilt(device, PRIVATE_DATA->ao_x_deflection, PRIVATE_DATA->ao_y_deflection);
+			res = sbig_ao_tip_tilt(PRIVATE_DATA->ao_x_deflection, PRIVATE_DATA->ao_y_deflection);
 		} else if (AO_GUIDE_SOUTH_ITEM->number.value > 0) {
 			PRIVATE_DATA->ao_y_deflection = AO_GUIDE_SOUTH_ITEM->number.value / -100.0;
-			res = sbig_ao_tip_tilt(device, PRIVATE_DATA->ao_x_deflection, PRIVATE_DATA->ao_y_deflection);
+			res = sbig_ao_tip_tilt(PRIVATE_DATA->ao_x_deflection, PRIVATE_DATA->ao_y_deflection);
 		} else if (PRIVATE_DATA->ao_y_deflection != 0) {
 			PRIVATE_DATA->ao_y_deflection = 0;
-			res = sbig_ao_tip_tilt(device, PRIVATE_DATA->ao_x_deflection, PRIVATE_DATA->ao_y_deflection);
+			res = sbig_ao_tip_tilt(PRIVATE_DATA->ao_x_deflection, PRIVATE_DATA->ao_y_deflection);
 		}
 		AO_GUIDE_NORTH_ITEM->number.value = AO_GUIDE_SOUTH_ITEM->number.value = 0;
 		AO_GUIDE_DEC_PROPERTY->state = res == CE_NO_ERROR ? INDIGO_OK_STATE : INDIGO_ALERT_STATE;
@@ -2352,13 +2307,13 @@ static indigo_result ao_change_property(indigo_device *device, indigo_client *cl
 		indigo_property_copy_values(AO_GUIDE_RA_PROPERTY, property, false);
 		if (AO_GUIDE_WEST_ITEM->number.value > 0) {
 			PRIVATE_DATA->ao_x_deflection = AO_GUIDE_WEST_ITEM->number.value / 100.0;
-			res = sbig_ao_tip_tilt(device, PRIVATE_DATA->ao_x_deflection, PRIVATE_DATA->ao_y_deflection);
+			res = sbig_ao_tip_tilt(PRIVATE_DATA->ao_x_deflection, PRIVATE_DATA->ao_y_deflection);
 		} else if (AO_GUIDE_EAST_ITEM->number.value > 0) {
 			PRIVATE_DATA->ao_x_deflection = AO_GUIDE_EAST_ITEM->number.value / -100.0;
-			res = sbig_ao_tip_tilt(device, PRIVATE_DATA->ao_x_deflection, PRIVATE_DATA->ao_y_deflection);
+			res = sbig_ao_tip_tilt(PRIVATE_DATA->ao_x_deflection, PRIVATE_DATA->ao_y_deflection);
 		} else if (PRIVATE_DATA->ao_x_deflection != 0) {
 			PRIVATE_DATA->ao_x_deflection = 0;
-			res = sbig_ao_tip_tilt(device, PRIVATE_DATA->ao_x_deflection, PRIVATE_DATA->ao_y_deflection);
+			res = sbig_ao_tip_tilt(PRIVATE_DATA->ao_x_deflection, PRIVATE_DATA->ao_y_deflection);
 		}
 		AO_GUIDE_WEST_ITEM->number.value = AO_GUIDE_EAST_ITEM->number.value = 0;
 		AO_GUIDE_RA_PROPERTY->state = res == CE_NO_ERROR ? INDIGO_OK_STATE : INDIGO_ALERT_STATE;
@@ -2368,7 +2323,7 @@ static indigo_result ao_change_property(indigo_device *device, indigo_client *cl
 		// -------------------------------------------------------------------------------- AO_RESET
 		indigo_property_copy_values(AO_RESET_PROPERTY, property, false);
 		if (AO_CENTER_ITEM->sw.value || AO_UNJAM_ITEM->sw.value) {
-			res = sbig_ao_center(device);
+			res = sbig_ao_center();
 			if (res == CE_NO_ERROR) {
 				PRIVATE_DATA->ao_x_deflection = PRIVATE_DATA->ao_y_deflection = 0;
 				AO_GUIDE_DEC_PROPERTY->state = INDIGO_OK_STATE;
@@ -2596,7 +2551,7 @@ static bool plug_optional_device(indigo_device *device) {
 	if ((res = sbig_command(CC_GET_CCD_INFO, &gcp, &(PRIVATE_DATA->imager_ccd_extended_info4))) == CE_NO_ERROR) {
 		INDIGO_DRIVER_DEBUG(DRIVER_NAME, "imager_ccd_extended_info4.capabilitiesBits = 0x%x", PRIVATE_DATA->imager_ccd_extended_info4.capabilitiesBits);
 		if (PRIVATE_DATA->imager_ccd_extended_info4.capabilitiesBits & 0x10) {
-			if ((res = sbig_ao_center_selected()) == CE_NO_ERROR) {
+			if ((res = sbig_ao_center()) == CE_NO_ERROR) {
 				if (!plug_ao(device, true)) {
 					return false;
 				}
