@@ -42,6 +42,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 #include <indigo/indigo_driver_xml.h>
@@ -54,6 +55,9 @@
 #define DRIVER_NAME "indigo_agent_ao"
 
 #define MAX_STARS 50
+#define MIN_DARK_FRAMES 3
+#define MAX_DARK_FRAMES 50
+#define DARK_SKIP_FRAMES 1
 #define FRAME_TIMEOUT 3.0
 #define STATS_PERIOD 0.5
 #define GUIDER_AGENT_PREFIX "Guider Agent"
@@ -101,6 +105,7 @@ enum {
 	S_CAL_PULSE,
 	S_DITHER_AMPLITUDE,
 	S_DITHER_FRAMES,
+	S_DARK_FRAMES,
 	S_RA_X,
 	S_RA_Y,
 	S_DEC_X,
@@ -140,6 +145,7 @@ static const setting_definition settings_definitions[S_COUNT] = {
 	{ "BUMP_CALIBRATION_PULSE", "Mount calibration pulse (s)", 0.05, 30, 0, 1 },
 	{ "DITHER_AMPLITUDE", "Dither amplitude (px, 0 = no dithering)", 0, 50, 0, 0 },
 	{ "DITHER_FRAMES", "Exposures between dithers", 1, 1000, 1, 1 },
+	{ "DARK_FRAME_COUNT", "Dark frames to combine", MIN_DARK_FRAMES, MAX_DARK_FRAMES, 1, 5 },
 	{ "RA_X", "AO RA axis X (px/step)", -1000, 1000, 0, 0 },
 	{ "RA_Y", "AO RA axis Y (px/step)", -1000, 1000, 0, 0 },
 	{ "DEC_X", "AO Dec axis X (px/step)", -1000, 1000, 0, 0 },
@@ -173,6 +179,8 @@ enum {
 	T_DITHER_Y,
 	T_SATURATED,
 	T_LOST,
+	T_DARK_FRAMES,
+	T_DARK_ACTIVE,
 	T_COUNT
 };
 
@@ -194,7 +202,9 @@ static const setting_definition stats_definitions[T_COUNT] = {
 	{ "DITHER_X", "Dither X (px)", -10000, 10000, 0, 0 },
 	{ "DITHER_Y", "Dither Y (px)", -10000, 10000, 0, 0 },
 	{ "SATURATED", "AO at its limit", 0, 1, 0, 0 },
-	{ "LOST_FRAMES", "Frames without star", 0, 1000000, 0, 0 }
+	{ "LOST_FRAMES", "Frames without star", 0, 1000000, 0, 0 },
+	{ "DARK_FRAMES", "Frames in the dark frame", 0, MAX_DARK_FRAMES, 0, 0 },
+	{ "DARK_ACTIVE", "Dark frame applied", 0, 1, 0, 0 }
 };
 
 // -------------------------------------------------------------------------------- private data
@@ -216,6 +226,10 @@ typedef struct {
 	char *work_data;
 	long work_size;
 	long work_capacity;
+	char *dark_data;
+	double dark_exposure;
+	int dark_count;
+	bool dark_warned;
 	bool frames_wanted;
 	bool streaming;
 	bool has_streaming;
@@ -268,6 +282,8 @@ typedef struct {
 #define AGENT_AO_EXERCISE_ITEM								(AGENT_START_PROCESS_PROPERTY->items + 2)
 #define AGENT_AO_CENTER_ITEM									(AGENT_START_PROCESS_PROPERTY->items + 3)
 #define AGENT_AO_TRACKING_ITEM								(AGENT_START_PROCESS_PROPERTY->items + 4)
+#define AGENT_AO_DARK_FRAME_ITEM							(AGENT_START_PROCESS_PROPERTY->items + 5)
+#define AGENT_AO_DARK_RESET_ITEM							(AGENT_START_PROCESS_PROPERTY->items + 6)
 #define AGENT_ABORT_PROCESS_PROPERTY					(DEVICE_PRIVATE_DATA->abort_process_property)
 #define AGENT_ABORT_PROCESS_ITEM							(AGENT_ABORT_PROCESS_PROPERTY->items + 0)
 #define AGENT_AO_MODE_PROPERTY								(DEVICE_PRIVATE_DATA->mode_property)
@@ -416,6 +432,7 @@ static bool start_frames(indigo_device *device) {
 	DEVICE_PRIVATE_DATA->saved_upload_mode = indigo_save_switch_state(device, CCD_UPLOAD_MODE_PROPERTY_NAME, CCD_UPLOAD_MODE_CLIENT_ITEM_NAME);
 	DEVICE_PRIVATE_DATA->saved_image_format = indigo_save_switch_state(device, CCD_IMAGE_FORMAT_PROPERTY_NAME, CCD_IMAGE_FORMAT_RAW_ITEM_NAME);
 	DEVICE_PRIVATE_DATA->streaming = false;
+	DEVICE_PRIVATE_DATA->dark_warned = false;
 	if (DEVICE_PRIVATE_DATA->has_streaming) {
 		static const char *names[] = { CCD_STREAMING_EXPOSURE_ITEM_NAME, CCD_STREAMING_COUNT_ITEM_NAME };
 		double values[] = { SET(S_EXPOSURE), -1 };
@@ -453,7 +470,7 @@ static void stop_frames(indigo_device *device) {
 }
 
 // Waits for the next image, copies it to the work buffer and validates it
-static bool get_frame(indigo_device *device, double timeout) {
+static bool get_raw_frame(indigo_device *device, double timeout) {
 	unsigned long serial = DEVICE_PRIVATE_DATA->frame_serial;
 	if (!DEVICE_PRIVATE_DATA->streaming) {
 		indigo_change_number_property_1(FILTER_DEVICE_CONTEXT->client, device->name, CCD_EXPOSURE_PROPERTY_NAME, CCD_EXPOSURE_ITEM_NAME, SET(S_EXPOSURE));
@@ -509,6 +526,115 @@ static bool get_frame(indigo_device *device, double timeout) {
 	}
 	size_t pixel_bytes = (size_t)header->width * header->height * bytes_per_pixel;
 	return pixel_bytes <= (size_t)DEVICE_PRIVATE_DATA->work_size - sizeof(indigo_raw_header);
+}
+
+// -------------------------------------------------------------------------------- dark frame
+
+// The samples of an image are 8 or 16 bit, an RGB pixel has three of them
+static bool raw_layout(uint32_t signature, int *channels, int *sample_size) {
+	switch (signature) {
+		case INDIGO_RAW_MONO8: *channels = 1; *sample_size = 1; return true;
+		case INDIGO_RAW_MONO16: *channels = 1; *sample_size = 2; return true;
+		case INDIGO_RAW_RGB24: *channels = 3; *sample_size = 1; return true;
+		case INDIGO_RAW_RGB48: *channels = 3; *sample_size = 2; return true;
+	}
+	return false;
+}
+
+static size_t raw_samples(const indigo_raw_header *header) {
+	int channels, sample_size;
+	return raw_layout(header->signature, &channels, &sample_size) ? (size_t)header->width * header->height * channels : 0;
+}
+
+// Median of a few values, the mean of the two middle ones when there is an even number of them
+static unsigned median_of(unsigned *values, int count) {
+	for (int i = 1; i < count; i++) {
+		unsigned value = values[i];
+		int j = i - 1;
+		while (j >= 0 && values[j] > value) {
+			values[j + 1] = values[j];
+			j--;
+		}
+		values[j + 1] = value;
+	}
+	return count % 2 ? values[count / 2] : (values[count / 2 - 1] + values[count / 2] + 1) / 2;
+}
+
+// Combines count images of the same size (one after another in frames, samples samples each) into their per sample median
+static void median_combine(const void *frames, size_t samples, int sample_size, int count, void *result) {
+	unsigned values[MAX_DARK_FRAMES];
+	for (size_t i = 0; i < samples; i++) {
+		for (int j = 0; j < count; j++) {
+			size_t index = (size_t)j * samples + i;
+			values[j] = sample_size == 1 ? ((const uint8_t *)frames)[index] : ((const uint16_t *)frames)[index];
+		}
+		unsigned median = median_of(values, count);
+		if (sample_size == 1) {
+			((uint8_t *)result)[i] = (uint8_t)median;
+		} else {
+			((uint16_t *)result)[i] = (uint16_t)median;
+		}
+	}
+}
+
+// Subtracts the dark samples from the image, the result does not go below zero
+static void subtract_dark(void *pixels, const void *dark, size_t samples, int sample_size) {
+	if (sample_size == 1) {
+		uint8_t *p = (uint8_t *)pixels;
+		const uint8_t *d = (const uint8_t *)dark;
+		for (size_t i = 0; i < samples; i++) {
+			p[i] = p[i] > d[i] ? p[i] - d[i] : 0;
+		}
+	} else {
+		uint16_t *p = (uint16_t *)pixels;
+		const uint16_t *d = (const uint16_t *)dark;
+		for (size_t i = 0; i < samples; i++) {
+			p[i] = p[i] > d[i] ? p[i] - d[i] : 0;
+		}
+	}
+}
+
+static void dark_clear(indigo_device *device) {
+	indigo_safe_free(DEVICE_PRIVATE_DATA->dark_data);
+	DEVICE_PRIVATE_DATA->dark_data = NULL;
+	DEVICE_PRIVATE_DATA->dark_count = 0;
+	DEVICE_PRIVATE_DATA->dark_exposure = 0;
+	STAT(T_DARK_FRAMES) = 0;
+	STAT(T_DARK_ACTIVE) = 0;
+}
+
+// The dark frame fits when it was taken with the exposure and the frame (size, binning, pixel format) of the image
+static bool dark_fits(indigo_device *device, const indigo_raw_header *header) {
+	const indigo_raw_header *dark = (const indigo_raw_header *)DEVICE_PRIVATE_DATA->dark_data;
+	return dark != NULL && dark->signature == header->signature && dark->width == header->width && dark->height == header->height && fabs(DEVICE_PRIVATE_DATA->dark_exposure - SET(S_EXPOSURE)) < 1e-6;
+}
+
+// The dark frame is optional, an image is used as it is without one or when it does not fit
+static void dark_apply(indigo_device *device) {
+	indigo_raw_header *header = (indigo_raw_header *)DEVICE_PRIVATE_DATA->work_data;
+	bool active = false;
+	if (DEVICE_PRIVATE_DATA->dark_data != NULL) {
+		if (dark_fits(device, header)) {
+			int channels, sample_size;
+			if (raw_layout(header->signature, &channels, &sample_size)) {
+				subtract_dark(header + 1, (indigo_raw_header *)DEVICE_PRIVATE_DATA->dark_data + 1, raw_samples(header), sample_size);
+				active = true;
+			}
+		} else if (!DEVICE_PRIVATE_DATA->dark_warned) {
+			DEVICE_PRIVATE_DATA->dark_warned = true;
+			indigo_send_message(device, BUSY_PROPERTY, "The dark frame was taken with another exposure or frame and is not used, take a new one or reset it");
+		}
+	}
+	STAT(T_DARK_ACTIVE) = active ? 1 : 0;
+}
+
+// Waits for the next image and subtracts the dark frame from it
+static bool get_frame(indigo_device *device, double timeout) {
+	if (!get_raw_frame(device, timeout)) {
+		return false;
+	}
+	dark_apply(device);
+	return true;
 }
 
 // -------------------------------------------------------------------------------- tracker
@@ -838,6 +964,86 @@ static void center_process(indigo_device *device) {
 	bool ok = ao_ready(device) && ao_center(device);
 	bump_reset(device);
 	process_end(device, ok, ok ? "AO centered" : "AO centering failed");
+}
+
+// Takes the dark frames with the exposure of the loop and keeps their median. The OAG must be covered, unless the camera closes its shutter for frame type DARK.
+// The images the calibrations and the loop measure are corrected with this dark frame while it fits.
+static void dark_process(indigo_device *device) {
+	process_begin(device, AGENT_AO_PHASE_DARK);
+	int count = (int)SET(S_DARK_FRAMES);
+	if (count < MIN_DARK_FRAMES) {
+		count = MIN_DARK_FRAMES;
+	} else if (count > MAX_DARK_FRAMES) {
+		count = MAX_DARK_FRAMES;
+	}
+	bool ok = INDIGO_FILTER_CCD_SELECTED;
+	int saved_frame_type = -1;
+	if (!ok) {
+		indigo_send_message(device, ALERT_PROPERTY, "No camera selected");
+	} else {
+		saved_frame_type = indigo_save_switch_state(device, CCD_FRAME_TYPE_PROPERTY_NAME, CCD_FRAME_TYPE_DARK_ITEM_NAME);
+		ok = start_frames(device);
+	}
+	char *stack = NULL;
+	char *dark = NULL;
+	size_t samples = 0, stack_bytes = 0;
+	int sample_size = 0, taken = 0;
+	indigo_raw_header first = { 0 };
+	if (ok) {
+		indigo_send_message(device, BUSY_PROPERTY, "Taking %d dark frames of %g s, the camera must be covered", count, SET(S_EXPOSURE));
+	}
+	// the first frames may still have been exposed before the frame type changed
+	for (int i = -DARK_SKIP_FRAMES; ok && i < count && !aborted(device); i++) {
+		if (!get_raw_frame(device, FRAME_TIMEOUT)) {
+			if (!aborted(device)) {
+				indigo_send_message(device, ALERT_PROPERTY, "No dark frame received from the camera");
+				ok = false;
+			}
+			break;
+		}
+		if (i < 0) {
+			continue;
+		}
+		indigo_raw_header *header = (indigo_raw_header *)DEVICE_PRIVATE_DATA->work_data;
+		if (taken == 0) {
+			int channels;
+			first = *header;
+			samples = raw_samples(header);
+			raw_layout(header->signature, &channels, &sample_size);
+			stack_bytes = samples * sample_size;
+			stack = indigo_safe_malloc((size_t)count * stack_bytes);
+		} else if (header->signature != first.signature || header->width != first.width || header->height != first.height) {
+			indigo_send_message(device, ALERT_PROPERTY, "The frame changed while the dark frames were taken");
+			ok = false;
+			break;
+		}
+		memcpy(stack + (size_t)taken * stack_bytes, header + 1, stack_bytes);
+		taken++;
+		STAT(T_DARK_FRAMES) = taken;
+		update_stats(device);
+	}
+	if (ok && !aborted(device) && taken == count) {
+		dark = indigo_safe_malloc(sizeof(indigo_raw_header) + stack_bytes);
+		memcpy(dark, &first, sizeof(indigo_raw_header));
+		median_combine(stack, samples, sample_size, count, dark + sizeof(indigo_raw_header));
+		dark_clear(device);
+		DEVICE_PRIVATE_DATA->dark_data = dark;
+		DEVICE_PRIVATE_DATA->dark_count = count;
+		DEVICE_PRIVATE_DATA->dark_exposure = SET(S_EXPOSURE);
+		indigo_send_message(device, OK_PROPERTY, "Dark frame of %d frames combined, %dx%d, exposure %g s", count, (int)first.width, (int)first.height, SET(S_EXPOSURE));
+	}
+	// a failed or aborted attempt keeps the previous dark frame
+	STAT(T_DARK_FRAMES) = DEVICE_PRIVATE_DATA->dark_count;
+	indigo_safe_free(stack);
+	stop_frames(device);
+	indigo_restore_switch_state(device, CCD_FRAME_TYPE_PROPERTY_NAME, saved_frame_type);
+	process_end(device, ok, ok ? "Dark frame taken" : "Dark frame failed");
+}
+
+static void dark_reset_process(indigo_device *device) {
+	process_begin(device, AGENT_AO_PHASE_DARK);
+	dark_clear(device);
+	process_end(device, true, "Dark frame reset");
 }
 
 // Visits the four corners and the centre of the range with an interval, the AO can be watched in the camera of the OAG
@@ -1264,7 +1470,7 @@ static indigo_result agent_device_attach(indigo_device *device) {
 		FILTER_DEVICE_CONTEXT->validate_related_agent = validate_related_agent;
 		FILTER_RELATED_AGENT_LIST_PROPERTY->hidden = false;
 		// -------------------------------------------------------------------------------- Process control
-		AGENT_START_PROCESS_PROPERTY = indigo_init_switch_property(NULL, device->name, AGENT_START_PROCESS_PROPERTY_NAME, "Agent", "Start process", INDIGO_OK_STATE, INDIGO_RW_PERM, INDIGO_ANY_OF_MANY_RULE, 5);
+		AGENT_START_PROCESS_PROPERTY = indigo_init_switch_property(NULL, device->name, AGENT_START_PROCESS_PROPERTY_NAME, "Agent", "Start process", INDIGO_OK_STATE, INDIGO_RW_PERM, INDIGO_ANY_OF_MANY_RULE, 7);
 		if (AGENT_START_PROCESS_PROPERTY == NULL) {
 			return INDIGO_FAILED;
 		}
@@ -1273,6 +1479,8 @@ static indigo_result agent_device_attach(indigo_device *device) {
 		indigo_init_switch_item(AGENT_AO_EXERCISE_ITEM, AGENT_AO_EXERCISE_ITEM_NAME, "Exercise AO", false);
 		indigo_init_switch_item(AGENT_AO_CENTER_ITEM, AGENT_AO_CENTER_ITEM_NAME, "Center AO", false);
 		indigo_init_switch_item(AGENT_AO_TRACKING_ITEM, AGENT_AO_TRACKING_ITEM_NAME, "Start AO loop", false);
+		indigo_init_switch_item(AGENT_AO_DARK_FRAME_ITEM, AGENT_AO_DARK_FRAME_ITEM_NAME, "Take dark frame", false);
+		indigo_init_switch_item(AGENT_AO_DARK_RESET_ITEM, AGENT_AO_DARK_RESET_ITEM_NAME, "Reset dark frame", false);
 		AGENT_ABORT_PROCESS_PROPERTY = indigo_init_switch_property(NULL, device->name, AGENT_ABORT_PROCESS_PROPERTY_NAME, "Agent", "Abort process", INDIGO_OK_STATE, INDIGO_RW_PERM, INDIGO_AT_MOST_ONE_RULE, 1);
 		if (AGENT_ABORT_PROCESS_PROPERTY == NULL) {
 			return INDIGO_FAILED;
@@ -1367,6 +1575,10 @@ static indigo_result agent_change_property(indigo_device *device, indigo_client 
 			start_process(device, center_process);
 		} else if (AGENT_AO_TRACKING_ITEM->sw.value) {
 			start_process(device, tracking_process);
+		} else if (AGENT_AO_DARK_FRAME_ITEM->sw.value) {
+			start_process(device, dark_process);
+		} else if (AGENT_AO_DARK_RESET_ITEM->sw.value) {
+			start_process(device, dark_reset_process);
 		} else {
 			AGENT_START_PROCESS_PROPERTY->state = INDIGO_OK_STATE;
 			indigo_update_property(device, AGENT_START_PROCESS_PROPERTY, NULL);
@@ -1438,6 +1650,7 @@ static indigo_result agent_device_detach(indigo_device *device) {
 	pthread_mutex_destroy(&DEVICE_PRIVATE_DATA->frame_mutex);
 	indigo_safe_free(DEVICE_PRIVATE_DATA->frame_data);
 	indigo_safe_free(DEVICE_PRIVATE_DATA->work_data);
+	indigo_safe_free(DEVICE_PRIVATE_DATA->dark_data);
 	INDIGO_DEVICE_DETACH_LOG(DRIVER_NAME, device->name);
 	return indigo_filter_device_detach(device);
 }

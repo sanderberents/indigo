@@ -47,6 +47,8 @@ extern "C" {
 #define AGENT_AO_EXERCISE_ITEM_NAME							"EXERCISE"
 #define AGENT_AO_CENTER_ITEM_NAME								"CENTER"
 #define AGENT_AO_TRACKING_ITEM_NAME							"TRACKING"
+#define AGENT_AO_DARK_FRAME_ITEM_NAME						"DARK_FRAME"
+#define AGENT_AO_DARK_RESET_ITEM_NAME						"DARK_RESET"
 
 // AO positioning: relative steps (ao_sx) or absolute percent (SBIG AO-7)
 #define AGENT_AO_MODE_PROPERTY_NAME							"AGENT_AO_MODE"
@@ -79,6 +81,7 @@ extern "C" {
 #define AGENT_AO_PHASE_CENTERING								5
 #define AGENT_AO_PHASE_FAILED										6
 #define AGENT_AO_PHASE_DONE											7
+#define AGENT_AO_PHASE_DARK											8
 
 /** Create AO agent instance
  */
