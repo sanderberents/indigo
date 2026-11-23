@@ -229,6 +229,7 @@ typedef struct {
 	char *dark_data;
 	double dark_exposure;
 	int dark_count;
+	unsigned dark_pedestal;
 	bool dark_warned;
 	bool frames_wanted;
 	bool streaming;
@@ -577,19 +578,43 @@ static void median_combine(const void *frames, size_t samples, int sample_size, 
 	}
 }
 
-// Subtracts the dark samples from the image, the result does not go below zero
-static void subtract_dark(void *pixels, const void *dark, size_t samples, int sample_size) {
+// Noise (sigma of a normal distribution) of the samples of the frames around their median. It is estimated from the mean absolute
+// deviation, corrected for the median coming from the same few samples. Outliers such as cosmic rays move it little.
+static double noise_around_median(const void *frames, size_t samples, int sample_size, int count, const void *median) {
+	double sum = 0;
+	for (size_t i = 0; i < samples; i++) {
+		double m = sample_size == 1 ? ((const uint8_t *)median)[i] : ((const uint16_t *)median)[i];
+		for (int j = 0; j < count; j++) {
+			size_t index = (size_t)j * samples + i;
+			double v = sample_size == 1 ? ((const uint8_t *)frames)[index] : ((const uint16_t *)frames)[index];
+			sum += fabs(v - m);
+		}
+	}
+	return 1.2533 * sqrt((double)count / (count - 1)) * sum / ((double)samples * count);
+}
+
+// Pedestal that keeps the noise of a dark subtracted image above zero: four sigma of the noise of the dark frames, which is at most 1/16 of the range
+static unsigned dark_pedestal_for(double noise, int sample_size) {
+	unsigned limit = sample_size == 1 ? 255 / 16 : 65535 / 16;
+	double pedestal = ceil(4 * noise);
+	return pedestal > limit ? limit : (unsigned)pedestal;
+}
+
+// Subtracts the dark samples from the image and adds the pedestal, so that the noise of the background is not cut at zero. The result stays within the range of the samples.
+static void subtract_dark(void *pixels, const void *dark, size_t samples, int sample_size, unsigned pedestal) {
 	if (sample_size == 1) {
 		uint8_t *p = (uint8_t *)pixels;
 		const uint8_t *d = (const uint8_t *)dark;
 		for (size_t i = 0; i < samples; i++) {
-			p[i] = p[i] > d[i] ? p[i] - d[i] : 0;
+			int value = (int)p[i] - d[i] + (int)pedestal;
+			p[i] = value < 0 ? 0 : (value > UINT8_MAX ? UINT8_MAX : value);
 		}
 	} else {
 		uint16_t *p = (uint16_t *)pixels;
 		const uint16_t *d = (const uint16_t *)dark;
 		for (size_t i = 0; i < samples; i++) {
-			p[i] = p[i] > d[i] ? p[i] - d[i] : 0;
+			int value = (int)p[i] - d[i] + (int)pedestal;
+			p[i] = value < 0 ? 0 : (value > UINT16_MAX ? UINT16_MAX : value);
 		}
 	}
 }
@@ -598,6 +623,7 @@ static void dark_clear(indigo_device *device) {
 	indigo_safe_free(DEVICE_PRIVATE_DATA->dark_data);
 	DEVICE_PRIVATE_DATA->dark_data = NULL;
 	DEVICE_PRIVATE_DATA->dark_count = 0;
+	DEVICE_PRIVATE_DATA->dark_pedestal = 0;
 	DEVICE_PRIVATE_DATA->dark_exposure = 0;
 	STAT(T_DARK_FRAMES) = 0;
 	STAT(T_DARK_ACTIVE) = 0;
@@ -617,7 +643,7 @@ static void dark_apply(indigo_device *device) {
 		if (dark_fits(device, header)) {
 			int channels, sample_size;
 			if (raw_layout(header->signature, &channels, &sample_size)) {
-				subtract_dark(header + 1, (indigo_raw_header *)DEVICE_PRIVATE_DATA->dark_data + 1, raw_samples(header), sample_size);
+				subtract_dark(header + 1, (indigo_raw_header *)DEVICE_PRIVATE_DATA->dark_data + 1, raw_samples(header), sample_size, DEVICE_PRIVATE_DATA->dark_pedestal);
 				active = true;
 			}
 		} else if (!DEVICE_PRIVATE_DATA->dark_warned) {
@@ -1026,11 +1052,13 @@ static void dark_process(indigo_device *device) {
 		dark = indigo_safe_malloc(sizeof(indigo_raw_header) + stack_bytes);
 		memcpy(dark, &first, sizeof(indigo_raw_header));
 		median_combine(stack, samples, sample_size, count, dark + sizeof(indigo_raw_header));
+		double noise = noise_around_median(stack, samples, sample_size, count, dark + sizeof(indigo_raw_header));
 		dark_clear(device);
 		DEVICE_PRIVATE_DATA->dark_data = dark;
 		DEVICE_PRIVATE_DATA->dark_count = count;
+		DEVICE_PRIVATE_DATA->dark_pedestal = dark_pedestal_for(noise, sample_size);
 		DEVICE_PRIVATE_DATA->dark_exposure = SET(S_EXPOSURE);
-		indigo_send_message(device, OK_PROPERTY, "Dark frame of %d frames combined, %dx%d, exposure %g s", count, (int)first.width, (int)first.height, SET(S_EXPOSURE));
+		indigo_send_message(device, OK_PROPERTY, "Dark frame of %d frames combined, %dx%d, exposure %g s, noise %.2f, pedestal %u", count, (int)first.width, (int)first.height, SET(S_EXPOSURE), noise, DEVICE_PRIVATE_DATA->dark_pedestal);
 	}
 	// a failed or aborted attempt keeps the previous dark frame
 	STAT(T_DARK_FRAMES) = DEVICE_PRIVATE_DATA->dark_count;
