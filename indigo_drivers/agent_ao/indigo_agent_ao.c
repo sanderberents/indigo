@@ -47,6 +47,7 @@
 
 #include <indigo/indigo_driver_xml.h>
 #include <indigo/indigo_filter.h>
+#include <indigo/indigo_ccd_driver.h>
 #include <indigo/indigo_raw_utils.h>
 
 #include "indigo_agent_ao.h"
@@ -58,6 +59,7 @@
 #define MIN_DARK_FRAMES 3
 #define MAX_DARK_FRAMES 50
 #define DARK_SKIP_FRAMES 1
+#define PREVIEW_PERIOD 1.0
 #define FRAME_TIMEOUT 3.0
 #define STATS_PERIOD 0.5
 #define GUIDER_AGENT_PREFIX "Guider Agent"
@@ -217,6 +219,7 @@ typedef struct {
 	indigo_property *dec_mode_property;
 	indigo_property *settings_property;
 	indigo_property *stats_property;
+	indigo_property *preview_property;
 	pthread_mutex_t frame_mutex;
 	char *frame_data;
 	long frame_size;
@@ -231,6 +234,9 @@ typedef struct {
 	int dark_count;
 	unsigned dark_pedestal;
 	bool dark_warned;
+	char *preview_data;
+	long preview_capacity;
+	double preview_time;
 	bool frames_wanted;
 	bool streaming;
 	bool has_streaming;
@@ -299,6 +305,8 @@ typedef struct {
 #define AGENT_AO_DEC_MODE_SOUTH_ITEM					(AGENT_AO_DEC_MODE_PROPERTY->items + 2)
 #define AGENT_AO_SETTINGS_PROPERTY						(DEVICE_PRIVATE_DATA->settings_property)
 #define AGENT_AO_STATS_PROPERTY								(DEVICE_PRIVATE_DATA->stats_property)
+#define AGENT_AO_PREVIEW_PROPERTY							(DEVICE_PRIVATE_DATA->preview_property)
+#define AGENT_AO_PREVIEW_ITEM									(AGENT_AO_PREVIEW_PROPERTY->items + 0)
 #define SET(n)																(AGENT_AO_SETTINGS_PROPERTY->items[n].number.value)
 #define STAT(n)																(AGENT_AO_STATS_PROPERTY->items[n].number.value)
 
@@ -654,12 +662,45 @@ static void dark_apply(indigo_device *device) {
 	STAT(T_DARK_ACTIVE) = active ? 1 : 0;
 }
 
+// Publishes the image the star positions are measured on (with the dark frame subtracted) as a stretched JPEG, once per PREVIEW_PERIOD
+static void preview_publish(indigo_device *device) {
+	double now = indigo_monotonic_time();
+	if (now - DEVICE_PRIVATE_DATA->preview_time < PREVIEW_PERIOD) {
+		return;
+	}
+	DEVICE_PRIVATE_DATA->preview_time = now;
+	indigo_raw_header *header = (indigo_raw_header *)DEVICE_PRIVATE_DATA->work_data;
+	int channels, sample_size;
+	if (!raw_layout(header->signature, &channels, &sample_size)) {
+		return;
+	}
+	void *jpeg = NULL;
+	unsigned long size = 0;
+	indigo_raw_to_jpeg(device, header + 1, (int)header->width, (int)header->height, 8 * channels * sample_size, NULL, &jpeg, &size, NULL, NULL, ccd_jpeg_stretch_params_lut[CCD_JPEG_STRETCH_NORMAL].target_background, ccd_jpeg_stretch_params_lut[CCD_JPEG_STRETCH_NORMAL].clipping_point, 0);
+	if (jpeg == NULL || size == 0) {
+		indigo_safe_free(jpeg);
+		return;
+	}
+	if ((long)size > DEVICE_PRIVATE_DATA->preview_capacity) {
+		DEVICE_PRIVATE_DATA->preview_data = indigo_safe_realloc(DEVICE_PRIVATE_DATA->preview_data, size);
+		DEVICE_PRIVATE_DATA->preview_capacity = size;
+	}
+	memcpy(DEVICE_PRIVATE_DATA->preview_data, jpeg, size);
+	free(jpeg);
+	AGENT_AO_PREVIEW_ITEM->blob.value = DEVICE_PRIVATE_DATA->preview_data;
+	AGENT_AO_PREVIEW_ITEM->blob.size = size;
+	INDIGO_COPY_NAME(AGENT_AO_PREVIEW_ITEM->blob.format, ".jpeg");
+	AGENT_AO_PREVIEW_PROPERTY->state = INDIGO_OK_STATE;
+	indigo_update_property(device, AGENT_AO_PREVIEW_PROPERTY, NULL);
+}
+
 // Waits for the next image and subtracts the dark frame from it
 static bool get_frame(indigo_device *device, double timeout) {
 	if (!get_raw_frame(device, timeout)) {
 		return false;
 	}
 	dark_apply(device);
+	preview_publish(device);
 	return true;
 }
 
@@ -1540,6 +1581,11 @@ static indigo_result agent_device_attach(indigo_device *device) {
 		if (AGENT_AO_SETTINGS_PROPERTY == NULL || AGENT_AO_STATS_PROPERTY == NULL) {
 			return INDIGO_FAILED;
 		}
+		AGENT_AO_PREVIEW_PROPERTY = indigo_init_blob_property(NULL, device->name, AGENT_AO_PREVIEW_PROPERTY_NAME, "Agent", "Preview of the image the stars are measured on", INDIGO_OK_STATE, 1);
+		if (AGENT_AO_PREVIEW_PROPERTY == NULL) {
+			return INDIGO_FAILED;
+		}
+		indigo_init_blob_item(AGENT_AO_PREVIEW_ITEM, AGENT_AO_PREVIEW_ITEM_NAME, "Image data");
 		// --------------------------------------------------------------------------------
 		pthread_mutex_init(&DEVICE_PRIVATE_DATA->mutex, NULL);
 		pthread_mutex_init(&DEVICE_PRIVATE_DATA->frame_mutex, NULL);
@@ -1564,6 +1610,7 @@ static indigo_result agent_enumerate_properties(indigo_device *device, indigo_cl
 	INDIGO_DEFINE_MATCHING_PROPERTY(AGENT_AO_DEC_MODE_PROPERTY);
 	INDIGO_DEFINE_MATCHING_PROPERTY(AGENT_AO_SETTINGS_PROPERTY);
 	INDIGO_DEFINE_MATCHING_PROPERTY(AGENT_AO_STATS_PROPERTY);
+	INDIGO_DEFINE_MATCHING_PROPERTY(AGENT_AO_PREVIEW_PROPERTY);
 	return indigo_filter_enumerate_properties(device, client, property);
 }
 
@@ -1673,12 +1720,14 @@ static indigo_result agent_device_detach(indigo_device *device) {
 	indigo_release_property(AGENT_AO_DEC_MODE_PROPERTY);
 	indigo_release_property(AGENT_AO_SETTINGS_PROPERTY);
 	indigo_release_property(AGENT_AO_STATS_PROPERTY);
+	indigo_release_property(AGENT_AO_PREVIEW_PROPERTY);
 	indigo_delete_frame_digest(&DEVICE_PRIVATE_DATA->reference);
 	pthread_mutex_destroy(&DEVICE_PRIVATE_DATA->mutex);
 	pthread_mutex_destroy(&DEVICE_PRIVATE_DATA->frame_mutex);
 	indigo_safe_free(DEVICE_PRIVATE_DATA->frame_data);
 	indigo_safe_free(DEVICE_PRIVATE_DATA->work_data);
 	indigo_safe_free(DEVICE_PRIVATE_DATA->dark_data);
+	indigo_safe_free(DEVICE_PRIVATE_DATA->preview_data);
 	INDIGO_DEVICE_DETACH_LOG(DRIVER_NAME, device->name);
 	return indigo_filter_device_detach(device);
 }

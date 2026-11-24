@@ -72,6 +72,10 @@ extern "C" {
 // Statistics
 #define AGENT_AO_STATS_PROPERTY_NAME						"AGENT_AO_STATS"
 
+// Preview (stretched JPEG, about once per second) of the image the stars are measured on, with the dark frame subtracted
+#define AGENT_AO_PREVIEW_PROPERTY_NAME					"AGENT_AO_PREVIEW"
+#define AGENT_AO_PREVIEW_ITEM_NAME							"IMAGE"
+
 // Phases reported by AGENT_AO_STATS.PHASE
 #define AGENT_AO_PHASE_IDLE											0
 #define AGENT_AO_PHASE_TRACKING									1
