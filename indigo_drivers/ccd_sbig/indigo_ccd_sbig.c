@@ -70,6 +70,7 @@
 
 #define TEMP_THRESHOLD      0.5
 #define TEMP_CHECK_TIME       3     /* Time between teperature checks (seconds) */
+#define SECONDARY_WAIT_MARGIN 10    /* Margin added to the guider exposure time when waiting for it (seconds) */
 
 #define SBIG_VENDOR_ID             0x0d97
 
@@ -640,7 +641,8 @@ static bool sbig_start_exposure(indigo_device *device, double exposure, bool dar
 			indigo_ccd_suspend_countdown(device);
 			INDIGO_DRIVER_DEBUG(DRIVER_NAME, "Need to wait for the secondary CCD to finish (status = 0x%x)", status);
 		}
-		int wait_cycles = 6000; /* 6000 * 100 ms = 10 min */
+		/* the secondary CCD can not take longer than its requested exposure time, stored when it was started */
+		double wait_deadline = indigo_monotonic_time() + PRIVATE_DATA->guider_ccd_exp_params.exposureTime / 100.0 + SECONDARY_WAIT_MARGIN;
 		while (status == 8) { /* Wait for it to finish otherwise it will close the shutter while main camera is exposing */
 			/* do not hold the driver mutex while waiting, the other CCD, abort and the cooler need it */
 			pthread_mutex_unlock(&driver_mutex);
@@ -651,7 +653,7 @@ static bool sbig_start_exposure(indigo_device *device, double exposure, bool dar
 				res = get_command_status(CC_START_EXPOSURE2, &status);
 			}
 			/* a failed query leaves the status unchanged, so never keep waiting on it */
-			if ((res != CE_NO_ERROR) || (--wait_cycles <= 0)) {
+			if ((res != CE_NO_ERROR) || ((status == 8) && (indigo_monotonic_time() > wait_deadline))) {
 				if (res != CE_NO_ERROR) {
 					INDIGO_DRIVER_ERROR(DRIVER_NAME, "Waiting for the secondary CCD failed: %d (%s)", res, sbig_error_string(res));
 				} else {
