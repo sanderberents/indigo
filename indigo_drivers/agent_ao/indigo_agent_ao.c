@@ -112,14 +112,19 @@ enum {
 	S_RA_Y,
 	S_DEC_X,
 	S_DEC_Y,
-	S_ANGLE,
-	S_SCALE_RA,
-	S_SCALE_DEC,
-	S_OAG_ANGLE,
-	S_SPEED_RA,
-	S_SPEED_DEC,
+	S_RA_MINUS_X,
+	S_RA_MINUS_Y,
+	S_DEC_MINUS_X,
+	S_DEC_MINUS_Y,
 	S_OAG_SOP,
-	S_OAG_COS_DEC,
+	S_WEST_X,
+	S_WEST_Y,
+	S_EAST_X,
+	S_EAST_Y,
+	S_NORTH_X,
+	S_NORTH_Y,
+	S_SOUTH_X,
+	S_SOUTH_Y,
 	S_COUNT
 };
 
@@ -152,14 +157,19 @@ static const setting_definition settings_definitions[S_COUNT] = {
 	{ "RA_Y", "AO RA axis Y (px/step)", -1000, 1000, 0, 0 },
 	{ "DEC_X", "AO Dec axis X (px/step)", -1000, 1000, 0, 0 },
 	{ "DEC_Y", "AO Dec axis Y (px/step)", -1000, 1000, 0, 0 },
-	{ "ANGLE", "AO RA axis angle (deg)", -360, 360, 0, 0 },
-	{ "SCALE_RA", "AO RA scale (px/step)", 0, 1000, 0, 0 },
-	{ "SCALE_DEC", "AO Dec scale (px/step)", 0, 1000, 0, 0 },
-	{ "OAG_ANGLE", "OAG angle on the sky (deg)", -360, 360, 0, 0 },
-	{ "SPEED_RA", "OAG RA speed at the equator (px/s)", 0, 1000, 0, 0 },
-	{ "SPEED_DEC", "OAG Dec speed (px/s, sign is the parity)", -1000, 1000, 0, 0 },
+	{ "RA_MINUS_X", "AO -RA direction X (px/step)", -1000, 1000, 0, 0 },
+	{ "RA_MINUS_Y", "AO -RA direction Y (px/step)", -1000, 1000, 0, 0 },
+	{ "DEC_MINUS_X", "AO -Dec direction X (px/step)", -1000, 1000, 0, 0 },
+	{ "DEC_MINUS_Y", "AO -Dec direction Y (px/step)", -1000, 1000, 0, 0 },
 	{ "OAG_SIDE_OF_PIER", "Side of pier at calibration", -1, 1, 1, 0 },
-	{ "OAG_COS_DEC", "cos(dec) at calibration", 0, 1, 0, 1 }
+	{ "WEST_X", "OAG +RA (west) pulse X (px/s at the equator)", -1000, 1000, 0, 0 },
+	{ "WEST_Y", "OAG +RA (west) pulse Y (px/s at the equator)", -1000, 1000, 0, 0 },
+	{ "EAST_X", "OAG -RA (east) pulse X (px/s at the equator)", -1000, 1000, 0, 0 },
+	{ "EAST_Y", "OAG -RA (east) pulse Y (px/s at the equator)", -1000, 1000, 0, 0 },
+	{ "NORTH_X", "OAG +Dec (north) pulse X (px/s)", -1000, 1000, 0, 0 },
+	{ "NORTH_Y", "OAG +Dec (north) pulse Y (px/s)", -1000, 1000, 0, 0 },
+	{ "SOUTH_X", "OAG -Dec (south) pulse X (px/s)", -1000, 1000, 0, 0 },
+	{ "SOUTH_Y", "OAG -Dec (south) pulse Y (px/s)", -1000, 1000, 0, 0 }
 };
 
 enum {
@@ -370,55 +380,147 @@ static double get_pixel_scale(indigo_device *device) {
 	return 3600 * sqrt(CCD_LENS_FOV_PIXEL_SCALE_WIDTH_ITEM->number.value * CCD_LENS_FOV_PIXEL_SCALE_HEIGHT_ITEM->number.value);
 }
 
-// -------------------------------------------------------------------------------- AO matrix and sky frame
+// -------------------------------------------------------------------------------- response model of the AO and of the mount
+
+// The response of the star to a signed request (AO steps or guide pulse seconds) along two axes. Every direction of every axis has a vector of its own,
+// so the positive and the negative direction of an axis need not be collinear or of the same scale, and the axes need not be orthogonal.
+// The response is piecewise linear: a positive request uses the positive vector of its axis, a negative request the negative vector.
+typedef struct {
+	double pos[2][2]; // [axis][x, y] displacement per unit of a positive request
+	double neg[2][2]; // [axis][x, y] displacement per unit of the magnitude of a negative request
+} response_model;
+
+#define MODEL_MIN_VECTOR 1e-9
+#define MODEL_MIN_GAP 20
+#define MODEL_MAX_GAP 160
+
+static void model_forward(const response_model *model, double a, double b, double *x, double *y) {
+	const double *va = a >= 0 ? model->pos[0] : model->neg[0];
+	const double *vb = b >= 0 ? model->pos[1] : model->neg[1];
+	*x = fabs(a) * va[0] + fabs(b) * vb[0];
+	*y = fabs(a) * va[1] + fabs(b) * vb[1];
+}
+
+// The request that makes the displacement: the quadrant is the pair of neighbouring vectors whose cone holds the displacement, there both magnitudes are not negative
+static void model_inverse(const response_model *model, double x, double y, double *a, double *b) {
+	double best = -INFINITY;
+	*a = *b = 0;
+	for (int i = 0; i < 4; i++) {
+		int neg_a = i & 1;
+		int neg_b = i >> 1;
+		const double *va = neg_a ? model->neg[0] : model->pos[0];
+		const double *vb = neg_b ? model->neg[1] : model->pos[1];
+		double det = va[0] * vb[1] - va[1] * vb[0];
+		if (fabs(det) < MODEL_MIN_VECTOR) {
+			continue;
+		}
+		double ma = (x * vb[1] - y * vb[0]) / det;
+		double mb = (va[0] * y - va[1] * x) / det;
+		if (fmin(ma, mb) > best) {
+			best = fmin(ma, mb);
+			*a = neg_a ? -fmax(ma, 0) : fmax(ma, 0);
+			*b = neg_b ? -fmax(mb, 0) : fmax(mb, 0);
+		}
+	}
+}
+
+// the length of the vector that applies to a request
+static double model_length(const response_model *model, int axis, double request) {
+	const double *v = request >= 0 ? model->pos[axis] : model->neg[axis];
+	return hypot(v[0], v[1]);
+}
+
+// The vectors +a, +b, -a, -b must follow each other around the circle in one sense with a gap between the neighbours that is neither too small nor 180 degrees or more,
+// otherwise the cones do not tile the plane and the model has no inverse
+static bool model_valid(const response_model *model) {
+	const double *v[4] = { model->pos[0], model->pos[1], model->neg[0], model->neg[1] };
+	double angle[4];
+	for (int i = 0; i < 4; i++) {
+		if (hypot(v[i][0], v[i][1]) < MODEL_MIN_VECTOR) {
+			return false;
+		}
+		angle[i] = atan2(v[i][1], v[i][0]);
+	}
+	for (int sense = 1; sense >= -1; sense -= 2) {
+		bool ok = true;
+		for (int i = 0; i < 4 && ok; i++) {
+			double gap = fmod(sense * (angle[(i + 1) % 4] - angle[i]), 2 * M_PI);
+			if (gap < 0) {
+				gap += 2 * M_PI;
+			}
+			gap = 180 * gap / M_PI;
+			ok = gap >= MODEL_MIN_GAP && gap <= MODEL_MAX_GAP;
+		}
+		if (ok) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// -------------------------------------------------------------------------------- AO model
+
+static void ao_model(indigo_device *device, response_model *model) {
+	model->pos[0][0] = SET(S_RA_X);
+	model->pos[0][1] = SET(S_RA_Y);
+	model->pos[1][0] = SET(S_DEC_X);
+	model->pos[1][1] = SET(S_DEC_Y);
+	model->neg[0][0] = SET(S_RA_MINUS_X);
+	model->neg[0][1] = SET(S_RA_MINUS_Y);
+	model->neg[1][0] = SET(S_DEC_MINUS_X);
+	model->neg[1][1] = SET(S_DEC_MINUS_Y);
+}
 
 static bool ao_calibrated(indigo_device *device) {
-	return fabs(SET(S_RA_X) * SET(S_DEC_Y) - SET(S_RA_Y) * SET(S_DEC_X)) > 1e-9;
+	response_model model;
+	ao_model(device, &model);
+	return model_valid(&model);
 }
 
 // star displacement caused by an AO deflection
 static void steps_to_px(indigo_device *device, double ra, double dec, double *x, double *y) {
-	*x = SET(S_RA_X) * ra + SET(S_DEC_X) * dec;
-	*y = SET(S_RA_Y) * ra + SET(S_DEC_Y) * dec;
+	response_model model;
+	ao_model(device, &model);
+	model_forward(&model, ra, dec, x, y);
 }
 
 // AO deflection that moves the star by a displacement
 static void px_to_steps(indigo_device *device, double x, double y, double *ra, double *dec) {
-	double det = SET(S_RA_X) * SET(S_DEC_Y) - SET(S_RA_Y) * SET(S_DEC_X);
-	*ra = (SET(S_DEC_Y) * x - SET(S_DEC_X) * y) / det;
-	*dec = (-SET(S_RA_Y) * x + SET(S_RA_X) * y) / det;
+	response_model model;
+	ao_model(device, &model);
+	model_inverse(&model, x, y, ra, dec);
+}
+
+// -------------------------------------------------------------------------------- mount model
+
+// the image turns by 180 degrees after a meridian flip, like the angle of the Guider Agent
+static bool oag_flipped(indigo_device *device) {
+	int calibrated = (int)SET(S_OAG_SOP);
+	return calibrated != 0 && DEVICE_PRIVATE_DATA->mount_sop != 0 && calibrated != DEVICE_PRIVATE_DATA->mount_sop;
+}
+
+// The star displacement per second of a west, east, north and south guide pulse at the declination with the cosine cos_dec. The RA vectors are stored for the equator.
+static bool mount_model(indigo_device *device, double cos_dec, response_model *model) {
+	double v[8] = { SET(S_WEST_X), SET(S_WEST_Y), SET(S_EAST_X), SET(S_EAST_Y), SET(S_NORTH_X), SET(S_NORTH_Y), SET(S_SOUTH_X), SET(S_SOUTH_Y) };
+	response_model result = { { { v[0] * cos_dec, v[1] * cos_dec }, { v[4], v[5] } }, { { v[2] * cos_dec, v[3] * cos_dec }, { v[6], v[7] } } };
+	if (!model_valid(&result)) {
+		return false;
+	}
+	if (oag_flipped(device)) {
+		for (int axis = 0; axis < 2; axis++) {
+			for (int k = 0; k < 2; k++) {
+				result.pos[axis][k] = -result.pos[axis][k];
+				result.neg[axis][k] = -result.neg[axis][k];
+			}
+		}
+	}
+	*model = result;
+	return true;
 }
 
 static bool mount_calibrated(indigo_device *device) {
-	return SET(S_SPEED_RA) > 0 && fabs(SET(S_SPEED_DEC)) > 0;
-}
-
-// the angle turns by 180 degrees after a meridian flip, like the angle of the Guider Agent
-static double oag_angle(indigo_device *device) {
-	double angle = SET(S_OAG_ANGLE);
-	int calibrated = (int)SET(S_OAG_SOP);
-	if (calibrated != 0 && DEVICE_PRIVATE_DATA->mount_sop != 0 && calibrated != DEVICE_PRIVATE_DATA->mount_sop) {
-		angle += 180;
-	}
-	return angle;
-}
-
-static double oag_parity(indigo_device *device) {
-	return SET(S_SPEED_DEC) < 0 ? -1 : 1;
-}
-
-// displacement in OAG pixels to pixels along the RA axis and the Dec axis
-static void px_to_sky(indigo_device *device, double x, double y, double *ra, double *dec) {
-	double angle = -M_PI * oag_angle(device) / 180;
-	*ra = x * cos(angle) + y * sin(angle);
-	*dec = oag_parity(device) * (x * sin(angle) - y * cos(angle));
-}
-
-static void sky_to_px(indigo_device *device, double ra, double dec, double *x, double *y) {
-	double angle = -M_PI * oag_angle(device) / 180;
-	dec *= oag_parity(device);
-	*x = ra * cos(angle) + dec * sin(angle);
-	*y = ra * sin(angle) - dec * cos(angle);
+	response_model model;
+	return mount_model(device, 1, &model);
 }
 
 // -------------------------------------------------------------------------------- frames
@@ -955,20 +1057,31 @@ static void bump_step(indigo_device *device, double dt) {
 	DEVICE_PRIVATE_DATA->bump_x += a_x * factor;
 	DEVICE_PRIVATE_DATA->bump_y += a_y * factor;
 	double now = indigo_monotonic_time();
-	double ra_px, dec_px;
-	px_to_sky(device, DEVICE_PRIVATE_DATA->bump_x - DEVICE_PRIVATE_DATA->done_x, DEVICE_PRIVATE_DATA->bump_y - DEVICE_PRIVATE_DATA->done_y, &ra_px, &dec_px);
+	double cos_dec = cos(M_PI * DEVICE_PRIVATE_DATA->mount_dec / 180);
+	if (cos_dec < 0.05) {
+		cos_dec = 0.05;
+	}
+	response_model model;
+	if (!mount_model(device, cos_dec, &model)) {
+		return;
+	}
+	double ra_s, dec_s;
+	model_inverse(&model, DEVICE_PRIVATE_DATA->bump_x - DEVICE_PRIVATE_DATA->done_x, DEVICE_PRIVATE_DATA->bump_y - DEVICE_PRIVATE_DATA->done_y, &ra_s, &dec_s);
+	// the displacement along the direction of each pulse in pixels
+	double ra_px = ra_s * model_length(&model, 0, ra_s);
+	double dec_px = dec_s * model_length(&model, 1, dec_s);
 	STAT(T_BUMP_RA_S) = round(1000 * ra_px * get_pixel_scale(device)) / 1000;
 	STAT(T_BUMP_DEC_S) = round(1000 * dec_px * get_pixel_scale(device)) / 1000;
 	double threshold = SET(S_BUMP_THRESHOLD);
 	if (now - DEVICE_PRIVATE_DATA->bump_pulse_time < SET(S_BUMP_INTERVAL) || (fabs(ra_px) < threshold && fabs(dec_px) < threshold)) {
 		return;
 	}
-	double cos_dec = cos(M_PI * DEVICE_PRIVATE_DATA->mount_dec / 180);
-	if (cos_dec < 0.05) {
-		cos_dec = 0.05;
+	if (fabs(ra_px) < threshold) {
+		ra_s = 0;
 	}
-	double ra_s = fabs(ra_px) >= threshold ? ra_px / (SET(S_SPEED_RA) * cos_dec) : 0;
-	double dec_s = fabs(dec_px) >= threshold ? dec_px / fabs(SET(S_SPEED_DEC)) : 0;
+	if (fabs(dec_px) < threshold) {
+		dec_s = 0;
+	}
 	if ((AGENT_AO_DEC_MODE_NORTH_ITEM->sw.value && dec_s < 0) || (AGENT_AO_DEC_MODE_SOUTH_ITEM->sw.value && dec_s > 0)) {
 		dec_s = 0;
 	}
@@ -990,7 +1103,7 @@ static void bump_step(indigo_device *device, double dt) {
 	DEVICE_PRIVATE_DATA->bump_pulse_time = now;
 	if (pulse_guide(device, ra_s, dec_s)) {
 		double x, y;
-		sky_to_px(device, ra_s * SET(S_SPEED_RA) * cos_dec, dec_s * fabs(SET(S_SPEED_DEC)), &x, &y);
+		model_forward(&model, ra_s, dec_s, &x, &y);
 		DEVICE_PRIVATE_DATA->done_x += x;
 		DEVICE_PRIVATE_DATA->done_y += y;
 	}
@@ -1142,32 +1255,32 @@ static void calibrate_process(indigo_device *device) {
 	bool ok = ao_ready(device) && start_frames(device) && ao_center(device);
 	// the calibration moves must stay within the maximum deflection, the AO is not asked for more
 	double step = fmin(SET(S_CAL_STEP), deflection_limit(device));
-	double ra_x = 0, ra_y = 0, dec_x = 0, dec_y = 0;
+	// every direction is measured on its own: +RA, -RA, +Dec, -Dec. Each is a move from the centre and back, measured against the centre before and after it.
+	static const double moves[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+	double vectors[4][2] = { { 0 } };
 	int frames = (int)SET(S_CAL_FRAMES);
 	for (int attempt = 0; ok && attempt < 4 && !aborted(device); attempt++) {
-		double b0x, b0y, ax, ay, b1x, b1y, cx, cy, b2x, b2y;
+		double base[5][2], moved[4][2];
 		double settle = SET(S_CAL_SETTLE);
-		ok = measure_average(device, frames, &b0x, &b0y);
-		ok = ok && ao_move_to(device, step, 0);
-		indigo_usleep((long)(settle * 1e6));
-		ok = ok && measure_average(device, frames, &ax, &ay);
-		ok = ok && ao_move_to(device, 0, 0);
-		indigo_usleep((long)(settle * 1e6));
-		ok = ok && measure_average(device, frames, &b1x, &b1y);
-		ok = ok && ao_move_to(device, 0, step);
-		indigo_usleep((long)(settle * 1e6));
-		ok = ok && measure_average(device, frames, &cx, &cy);
-		ok = ok && ao_move_to(device, 0, 0);
-		indigo_usleep((long)(settle * 1e6));
-		ok = ok && measure_average(device, frames, &b2x, &b2y);
+		ok = measure_average(device, frames, &base[0][0], &base[0][1]);
+		for (int i = 0; ok && i < 4; i++) {
+			ok = ao_move_to(device, step * moves[i][0], step * moves[i][1]);
+			indigo_usleep((long)(settle * 1e6));
+			ok = ok && measure_average(device, frames, &moved[i][0], &moved[i][1]);
+			ok = ok && ao_move_to(device, 0, 0);
+			indigo_usleep((long)(settle * 1e6));
+			ok = ok && measure_average(device, frames, &base[i + 1][0], &base[i + 1][1]);
+		}
 		if (!ok) {
 			break;
 		}
-		ra_x = (ax - (b0x + b1x) / 2) / step;
-		ra_y = (ay - (b0y + b1y) / 2) / step;
-		dec_x = (cx - (b1x + b2x) / 2) / step;
-		dec_y = (cy - (b1y + b2y) / 2) / step;
-		if (hypot(ra_x, ra_y) < 0.05 || hypot(dec_x, dec_y) < 0.05) {
+		bool weak = false;
+		for (int i = 0; i < 4; i++) {
+			vectors[i][0] = (moved[i][0] - (base[i][0] + base[i + 1][0]) / 2) / step;
+			vectors[i][1] = (moved[i][1] - (base[i][1] + base[i + 1][1]) / 2) / step;
+			weak = weak || hypot(vectors[i][0], vectors[i][1]) < 0.05;
+		}
+		if (weak) {
 			if (step * 2 > deflection_limit(device)) {
 				ok = false;
 				indigo_send_message(device, ALERT_PROPERTY, "The star does not move with the AO, check the AO and the camera");
@@ -1175,31 +1288,32 @@ static void calibrate_process(indigo_device *device) {
 			}
 			step *= 2;
 			indigo_send_message(device, BUSY_PROPERTY, "Increasing the AO calibration step to %g", step);
-			ra_x = ra_y = dec_x = dec_y = 0;
+			memset(vectors, 0, sizeof(vectors));
 			continue;
 		}
 		break;
 	}
 	if (ok && !aborted(device)) {
-		double ra_scale = hypot(ra_x, ra_y);
-		double dec_scale = hypot(dec_x, dec_y);
-		double cos_angle = ra_scale > 0 && dec_scale > 0 ? (ra_x * dec_x + ra_y * dec_y) / (ra_scale * dec_scale) : 1;
-		if (ra_scale < 0.05 || dec_scale < 0.05) {
+		response_model model = { { { vectors[0][0], vectors[0][1] }, { vectors[2][0], vectors[2][1] } }, { { vectors[1][0], vectors[1][1] }, { vectors[3][0], vectors[3][1] } } };
+		if (!model_valid(&model)) {
 			ok = false;
-		} else if (fabs(cos_angle) > 0.5) {
-			ok = false;
-			indigo_send_message(device, ALERT_PROPERTY, "The AO axes are not orthogonal in the image (cos = %.2f)", cos_angle);
+			indigo_send_message(device, ALERT_PROPERTY, "The AO directions are not usable, the neighbouring ones must follow each other around the image %d to %d degrees apart", MODEL_MIN_GAP, MODEL_MAX_GAP);
 		} else {
-			SET(S_RA_X) = ra_x;
-			SET(S_RA_Y) = ra_y;
-			SET(S_DEC_X) = dec_x;
-			SET(S_DEC_Y) = dec_y;
-			SET(S_ANGLE) = round(1000 * 180 * atan2(-ra_y, ra_x) / M_PI) / 1000;
-			SET(S_SCALE_RA) = round(1000 * ra_scale) / 1000;
-			SET(S_SCALE_DEC) = round(1000 * dec_scale) / 1000;
+			SET(S_RA_X) = vectors[0][0];
+			SET(S_RA_Y) = vectors[0][1];
+			SET(S_RA_MINUS_X) = vectors[1][0];
+			SET(S_RA_MINUS_Y) = vectors[1][1];
+			SET(S_DEC_X) = vectors[2][0];
+			SET(S_DEC_Y) = vectors[2][1];
+			SET(S_DEC_MINUS_X) = vectors[3][0];
+			SET(S_DEC_MINUS_Y) = vectors[3][1];
+			double ra_plus = hypot(vectors[0][0], vectors[0][1]);
+			double ra_minus = hypot(vectors[1][0], vectors[1][1]);
+			double dec_plus = hypot(vectors[2][0], vectors[2][1]);
+			double dec_minus = hypot(vectors[3][0], vectors[3][1]);
 			indigo_update_property(device, AGENT_AO_SETTINGS_PROPERTY, NULL);
 			save_config(device);
-			indigo_send_message(device, OK_PROPERTY, "AO calibrated: %.3f px/step along RA, %.3f px/step along Dec", ra_scale, dec_scale);
+			indigo_send_message(device, OK_PROPERTY, "AO calibrated: %.3f / %.3f px/step along +RA / -RA, %.3f / %.3f px/step along +Dec / -Dec", ra_plus, ra_minus, dec_plus, dec_minus);
 		}
 	}
 	stop_frames(device);
@@ -1223,7 +1337,7 @@ static bool pulse_and_measure(indigo_device *device, double ra_seconds, double d
 	return true;
 }
 
-// The mount is pulsed in all directions while the AO holds the centre, which gives the orientation and the speed of the OAG image
+// The mount is pulsed in all directions while the AO holds the centre, which gives the orientation and the speed of the OAG image in each direction
 static void bump_calibrate_process(indigo_device *device) {
 	process_begin(device, AGENT_AO_PHASE_BUMP_CALIBRATING);
 	bool ok = true;
@@ -1236,39 +1350,50 @@ static void bump_calibrate_process(indigo_device *device) {
 	}
 	ok = ok && ao_ready(device) && start_frames(device) && ao_center(device);
 	double pulse = SET(S_CAL_PULSE);
-	double north_x = 0, north_y = 0, south_x = 0, south_y = 0, west_x = 0, west_y = 0, east_x = 0, east_y = 0, ignored_x, ignored_y;
-	// the first north pulse takes up the backlash
-	ok = ok && pulse_and_measure(device, 0, pulse, &ignored_x, &ignored_y);
-	ok = ok && pulse_and_measure(device, 0, pulse, &north_x, &north_y);
-	ok = ok && pulse_and_measure(device, 0, -pulse, &south_x, &south_y);
-	ok = ok && pulse_and_measure(device, pulse, 0, &west_x, &west_y);
-	ok = ok && pulse_and_measure(device, -pulse, 0, &east_x, &east_y);
+	// north, south, west, east, each pulsed twice: the first pulse takes up the backlash of the reversal, the second one is measured
+	static const double directions[4][2] = { { 0, 1 }, { 0, -1 }, { 1, 0 }, { -1, 0 } };
+	double responses[4][2] = { { 0 } };
+	double ignored_x, ignored_y;
+	for (int i = 0; ok && i < 4 && !aborted(device); i++) {
+		ok = pulse_and_measure(device, pulse * directions[i][0], pulse * directions[i][1], &ignored_x, &ignored_y);
+		ok = ok && pulse_and_measure(device, pulse * directions[i][0], pulse * directions[i][1], &responses[i][0], &responses[i][1]);
+	}
 	if (ok && !aborted(device)) {
-		double ra_x = (west_x - east_x) / 2 / pulse;
-		double ra_y = (west_y - east_y) / 2 / pulse;
-		double dec_x = (north_x - south_x) / 2 / pulse;
-		double dec_y = (north_y - south_y) / 2 / pulse;
-		double ra_speed = hypot(ra_x, ra_y);
-		double dec_speed = hypot(dec_x, dec_y);
-		if (ra_speed < 0.01 || dec_speed < 0.01) {
+		bool weak = false;
+		for (int i = 0; i < 4; i++) {
+			weak = weak || hypot(responses[i][0], responses[i][1]) / pulse < 0.01;
+		}
+		double cos_dec = cos(M_PI * DEVICE_PRIVATE_DATA->mount_dec / 180);
+		if (cos_dec < 0.05) {
+			cos_dec = 0.05;
+		}
+		// px/s of every direction, those of RA at the equator
+		response_model model;
+		for (int k = 0; k < 2; k++) {
+			model.pos[1][k] = round(10000 * responses[0][k] / pulse) / 10000;
+			model.neg[1][k] = round(10000 * responses[1][k] / pulse) / 10000;
+			model.pos[0][k] = round(10000 * responses[2][k] / pulse / cos_dec) / 10000;
+			model.neg[0][k] = round(10000 * responses[3][k] / pulse / cos_dec) / 10000;
+		}
+		if (weak) {
 			indigo_send_message(device, ALERT_PROPERTY, "The star does not move with the guide pulses, check the guide port, the camera and the AO");
 			ok = false;
+		} else if (!model_valid(&model)) {
+			indigo_send_message(device, ALERT_PROPERTY, "The OAG directions are not usable, the neighbouring ones must follow each other around the image %d to %d degrees apart", MODEL_MIN_GAP, MODEL_MAX_GAP);
+			ok = false;
 		} else {
-			double angle = atan2(-ra_y, ra_x);
-			double cos_dec = cos(M_PI * DEVICE_PRIVATE_DATA->mount_dec / 180);
-			if (cos_dec < 0.05) {
-				cos_dec = 0.05;
-			}
-			// positive Dec of the sky frame is the direction of the north pulse when the image is not mirrored
-			double parity = (dec_x * -sin(angle) + dec_y * -cos(angle)) >= 0 ? 1 : -1;
-			SET(S_OAG_ANGLE) = round(1000 * 180 * angle / M_PI) / 1000;
-			SET(S_SPEED_RA) = round(10000 * ra_speed / cos_dec) / 10000;
-			SET(S_SPEED_DEC) = parity * round(10000 * dec_speed) / 10000;
+			SET(S_WEST_X) = model.pos[0][0];
+			SET(S_WEST_Y) = model.pos[0][1];
+			SET(S_EAST_X) = model.neg[0][0];
+			SET(S_EAST_Y) = model.neg[0][1];
+			SET(S_NORTH_X) = model.pos[1][0];
+			SET(S_NORTH_Y) = model.pos[1][1];
+			SET(S_SOUTH_X) = model.neg[1][0];
+			SET(S_SOUTH_Y) = model.neg[1][1];
 			SET(S_OAG_SOP) = DEVICE_PRIVATE_DATA->mount_sop;
-			SET(S_OAG_COS_DEC) = cos_dec;
 			indigo_update_property(device, AGENT_AO_SETTINGS_PROPERTY, NULL);
 			save_config(device);
-			indigo_send_message(device, OK_PROPERTY, "OAG calibrated: angle %.1f deg, %.3f px/s along RA at the equator, %.3f px/s along Dec", SET(S_OAG_ANGLE), SET(S_SPEED_RA), dec_speed);
+			indigo_send_message(device, OK_PROPERTY, "OAG calibrated: %.3f / %.3f px/s along +RA / -RA at the equator, %.3f / %.3f px/s along +Dec / -Dec", hypot(model.pos[0][0], model.pos[0][1]), hypot(model.neg[0][0], model.neg[0][1]), hypot(model.pos[1][0], model.pos[1][1]), hypot(model.neg[1][0], model.neg[1][1]));
 		}
 	}
 	stop_frames(device);
