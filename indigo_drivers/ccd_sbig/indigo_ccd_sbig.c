@@ -70,7 +70,8 @@
 
 #define TEMP_THRESHOLD      0.5
 #define TEMP_CHECK_TIME       3     /* Time between teperature checks (seconds) */
-#define SECONDARY_WAIT_MARGIN 10    /* Margin added to the guider exposure time when waiting for it (seconds) */
+#define SHUTTER_WAIT_MARGIN  10     /* Time limit for waiting for the other CCD beyond its remaining exposure time (seconds) */
+#define SHUTTER_WAIT_POLL    10000  /* Poll interval while waiting for the other CCD (microseconds) */
 
 #define SBIG_VENDOR_ID             0x0d97
 
@@ -110,6 +111,12 @@
 
 // -------------------------------------------------------------------------------- SBIG USB interface implementation
 
+typedef enum {
+	SBIG_EXPOSURE_STARTED,
+	SBIG_EXPOSURE_FAILED,
+	SBIG_EXPOSURE_CANCELLED     /* aborted or disconnected before it was started */
+} sbig_exposure_result;
+
 typedef struct {
 	/* General */
 	bool is_usb;
@@ -144,6 +151,12 @@ typedef struct {
 	GetCCDInfoResults4 guider_ccd_extended_info4;
 	bool guider_no_check_temperature;
 	unsigned char *guider_buffer;
+
+	/* Both CCDs share the shutter, protected by driver_mutex */
+	int imager_waiting;          /* the imager waits to start its exposure, no guider exposure may start */
+	int guider_exposing;         /* a guider exposure is started and not yet ended */
+	double guider_exposure_end;  /* monotonic time the integration of the guider exposure ends */
+	unsigned imager_abort_count, guider_abort_count;
 
 	/* Guider Specific */
 	indigo_timer *guider_timer_ra, *guider_timer_dec;
@@ -437,7 +450,7 @@ static ushort sbig_clear_relays(short handle, ushort relays) {
 
 /* The SBIG driver library keeps one "current" handle per process and is not re-entrant, so every command must be sent
    with driver_mutex held and with the handle of the camera selected under that same lock. Nothing may hold the mutex
-   for long (see the wait for the secondary CCD in sbig_start_exposure()), otherwise the AO commands wait behind it. */
+   for long (see sbig_wait_for_other_ccd()), otherwise the AO commands wait behind it. */
 static int sbig_ao_tip_tilt(indigo_device *device, double x_deflection, double y_deflection) {
 	assert(fabs(x_deflection) <= 1.0);
 	assert(fabs(y_deflection) <= 1.0);
@@ -593,26 +606,44 @@ static bool sbig_open(indigo_device *device) {
 }
 
 
-static bool sbig_start_exposure(indigo_device *device, double exposure, bool dark, int offset_x, int offset_y, int frame_width, int frame_height, int bin_x, int bin_y) {
+/* Waits until *busy, set by the other CCD, drops to zero. The caller owns driver_mutex, it is released while sleeping so
+   the other CCD can make progress. Gives up if the exposure of this device is aborted (abort_count is its abort counter
+   on entry of sbig_start_exposure()), the device is being disconnected or the time out expires. */
+static sbig_exposure_result sbig_wait_for_other_ccd(indigo_device *device, const int *busy, unsigned abort_count, double timeout) {
+	unsigned *current_abort_count = PRIMARY_CCD ? &PRIVATE_DATA->imager_abort_count : &PRIVATE_DATA->guider_abort_count;
+	double deadline = indigo_monotonic_time() + timeout;
+
+	while (*busy) {
+		pthread_mutex_unlock(&driver_mutex);
+		indigo_usleep(SHUTTER_WAIT_POLL);
+		pthread_mutex_lock(&driver_mutex);
+		if ((*current_abort_count != abort_count) || (CCD_EXPOSURE_PROPERTY->state != INDIGO_BUSY_STATE) || !CONNECTION_CONNECTED_ITEM->sw.value) {
+			return SBIG_EXPOSURE_CANCELLED;
+		}
+		if (*busy && (indigo_monotonic_time() > deadline)) {
+			INDIGO_DRIVER_ERROR(DRIVER_NAME, "Waiting for the %s CCD timed out", PRIMARY_CCD ? "guider" : "imager");
+			return SBIG_EXPOSURE_FAILED;
+		}
+	}
+	return SBIG_EXPOSURE_STARTED;
+}
+
+
+/* Sends the exposure of the device to the camera, the caller owns driver_mutex */
+static bool sbig_send_exposure(indigo_device *device, double exposure, bool dark, int offset_x, int offset_y, int frame_width, int frame_height, int bin_x, int bin_y) {
 	int res;
 	StartExposureParams2 *sep;
 	unsigned short binning_mode;
 	unsigned short shutter_mode;
 
-	indigo_use_shortest_exposure_if_bias(device);
-
-	pthread_mutex_lock(&driver_mutex);
-
 	res = set_sbig_handle(PRIVATE_DATA->driver_handle);
 	if (res != CE_NO_ERROR) {
 		INDIGO_DRIVER_ERROR(DRIVER_NAME, "set_sbig_handle(%d) = %d (%s)", PRIVATE_DATA->driver_handle, res, sbig_error_string(res));
-		pthread_mutex_unlock(&driver_mutex);
 		return false;
 	}
 
 	res = sbig_get_bin_mode(device, &binning_mode);
 	if (res != CE_NO_ERROR) {
-		pthread_mutex_unlock(&driver_mutex);
 		return false;
 	}
 
@@ -627,45 +658,6 @@ static bool sbig_start_exposure(indigo_device *device, double exposure, bool dar
 		sep->ccd = CCD_IMAGING;
 		sep->abgState = (unsigned short)PRIVATE_DATA->imager_abg_state;
 		INDIGO_DRIVER_DEBUG(DRIVER_NAME, "Imager ABG mode = %d", PRIVATE_DATA->imager_abg_state);
-
-		/* Check if the secondary CCD is in use */
-		unsigned short status;
-		res = get_command_status(CC_START_EXPOSURE2, &status);
-		if (res != CE_NO_ERROR) {
-			INDIGO_DRIVER_ERROR(DRIVER_NAME, "CC_QUERY_COMMAND_STATUS error = %d (%s)", res, sbig_error_string(res));
-			pthread_mutex_unlock(&driver_mutex);
-			return false;
-		}
-		INDIGO_DRIVER_DEBUG(DRIVER_NAME, "Primary CCD: status = 0x%x", status);
-		if (status == 8) { /* Secondary CCD exposure is in progress */
-			indigo_ccd_suspend_countdown(device);
-			INDIGO_DRIVER_DEBUG(DRIVER_NAME, "Need to wait for the secondary CCD to finish (status = 0x%x)", status);
-		}
-		/* the secondary CCD can not take longer than its requested exposure time, stored when it was started */
-		double wait_deadline = indigo_monotonic_time() + PRIVATE_DATA->guider_ccd_exp_params.exposureTime / 100.0 + SECONDARY_WAIT_MARGIN;
-		while (status == 8) { /* Wait for it to finish otherwise it will close the shutter while main camera is exposing */
-			/* do not hold the driver mutex while waiting, the other CCD, abort and the cooler need it */
-			pthread_mutex_unlock(&driver_mutex);
-			indigo_usleep(100000); // 100ms
-			pthread_mutex_lock(&driver_mutex);
-			res = set_sbig_handle(PRIVATE_DATA->driver_handle);
-			if (res == CE_NO_ERROR) {
-				res = get_command_status(CC_START_EXPOSURE2, &status);
-			}
-			/* a failed query leaves the status unchanged, so never keep waiting on it */
-			if ((res != CE_NO_ERROR) || ((status == 8) && (indigo_monotonic_time() > wait_deadline))) {
-				if (res != CE_NO_ERROR) {
-					INDIGO_DRIVER_ERROR(DRIVER_NAME, "Waiting for the secondary CCD failed: %d (%s)", res, sbig_error_string(res));
-				} else {
-					INDIGO_DRIVER_ERROR(DRIVER_NAME, "Waiting for the secondary CCD timed out");
-				}
-				indigo_ccd_resume_countdown(device);
-				pthread_mutex_unlock(&driver_mutex);
-				return false;
-			}
-		}
-		indigo_ccd_resume_countdown(device);
-
 	} else {
 		sep = &(PRIVATE_DATA->guider_ccd_exp_params);
 		sep->abgState = (unsigned short)ABG_LOW7;
@@ -676,7 +668,6 @@ static bool sbig_start_exposure(indigo_device *device, double exposure, bool dar
 		res = get_command_status(CC_START_EXPOSURE2, &status);
 		if (res != CE_NO_ERROR) {
 			INDIGO_DRIVER_ERROR(DRIVER_NAME, "CC_QUERY_COMMAND_STATUS error = %d (%s)", res, sbig_error_string(res));
-			pthread_mutex_unlock(&driver_mutex);
 			return false;
 		}
 		INDIGO_DRIVER_DEBUG(DRIVER_NAME, "Secondary CCD: status = 0x%x", status);
@@ -696,12 +687,57 @@ static bool sbig_start_exposure(indigo_device *device, double exposure, bool dar
 	res = sbig_command(CC_START_EXPOSURE2, sep, NULL);
 	if (res != CE_NO_ERROR) {
 		INDIGO_DRIVER_ERROR(DRIVER_NAME, "CC_START_EXPOSURE2 = %d (%s)", res, sbig_error_string(res));
-		pthread_mutex_unlock(&driver_mutex);
 		return false;
 	}
 
-	pthread_mutex_unlock(&driver_mutex);
+	if (!PRIMARY_CCD) {
+		PRIVATE_DATA->guider_exposing = 1;
+		PRIVATE_DATA->guider_exposure_end = indigo_monotonic_time() + exposure;
+	}
 	return true;
+}
+
+
+/* The imager must not start while a guider exposure is running, the end of the guider exposure could close the shutter.
+   A waiting imager goes first and no new guider exposure starts until it is started, otherwise back to back guider
+   exposures could keep it waiting forever. Guider exposures started during an imager exposure leave the shutter alone. */
+static sbig_exposure_result sbig_start_exposure(indigo_device *device, double exposure, bool dark, int offset_x, int offset_y, int frame_width, int frame_height, int bin_x, int bin_y) {
+	sbig_exposure_result result = SBIG_EXPOSURE_STARTED;
+	bool countdown_suspended = false;
+
+	indigo_use_shortest_exposure_if_bias(device);
+
+	pthread_mutex_lock(&driver_mutex);
+	unsigned abort_count = PRIMARY_CCD ? PRIVATE_DATA->imager_abort_count : PRIVATE_DATA->guider_abort_count;
+
+	if (!PRIMARY_CCD) {
+		/* a new exposure is requested only if the previous one is finished */
+		PRIVATE_DATA->guider_exposing = 0;
+		result = sbig_wait_for_other_ccd(device, &PRIVATE_DATA->imager_waiting, abort_count, SHUTTER_WAIT_MARGIN);
+	} else if (PRIVATE_DATA->guider_exposing) {
+		INDIGO_DRIVER_DEBUG(DRIVER_NAME, "Need to wait for the guider CCD to finish");
+		PRIVATE_DATA->imager_waiting++;
+		/* the countdown publishes properties, so it must not be stopped with driver_mutex held */
+		pthread_mutex_unlock(&driver_mutex);
+		indigo_ccd_suspend_countdown(device);
+		countdown_suspended = true;
+		pthread_mutex_lock(&driver_mutex);
+		double timeout = fmax(0, PRIVATE_DATA->guider_exposure_end - indigo_monotonic_time()) + SHUTTER_WAIT_MARGIN;
+		result = sbig_wait_for_other_ccd(device, &PRIVATE_DATA->guider_exposing, abort_count, timeout);
+		/* driver_mutex is held until the exposure is started, no guider exposure can get in between */
+		PRIVATE_DATA->imager_waiting--;
+	}
+
+	if ((result == SBIG_EXPOSURE_STARTED) && !sbig_send_exposure(device, exposure, dark, offset_x, offset_y, frame_width, frame_height, bin_x, bin_y)) {
+		result = SBIG_EXPOSURE_FAILED;
+	}
+	pthread_mutex_unlock(&driver_mutex);
+
+	if (countdown_suspended) {
+		/* resume even if the exposure was not started, otherwise the countdown stays disabled for the next one */
+		indigo_ccd_resume_countdown(device);
+	}
+	return result;
 }
 
 
@@ -762,6 +798,11 @@ static bool sbig_read_pixels(indigo_device *device) {
 
 	pthread_mutex_lock(&driver_mutex);
 
+	if (!PRIMARY_CCD) {
+		/* driver_mutex is held until the exposure is ended and read out */
+		PRIVATE_DATA->guider_exposing = 0;
+	}
+
 	res = set_sbig_handle(PRIVATE_DATA->driver_handle);
 	if (res != CE_NO_ERROR) {
 		INDIGO_DRIVER_ERROR(DRIVER_NAME, "set_sbig_handle(%d) = %d (%s)", PRIVATE_DATA->driver_handle, res, sbig_error_string(res));
@@ -797,19 +838,9 @@ static bool sbig_read_pixels(indigo_device *device) {
 	EndExposureParams eep = {
 		.ccd = srp.ccd
 	};
-	/* Skip end exposure shutter delay for secondary CCD if primary CCD exposure is in progress */
-	if (!PRIMARY_CCD) {
-		unsigned short status;
-		res = get_command_status(CC_START_EXPOSURE2, &status);
-		if (res != CE_NO_ERROR) {
-			INDIGO_DRIVER_ERROR(DRIVER_NAME, "CC_QUERY_COMMAND_STATUS error = %d (%s)", res, sbig_error_string(res));
-			pthread_mutex_unlock(&driver_mutex);
-			return false;
-		}
-		INDIGO_DRIVER_DEBUG(DRIVER_NAME, "Secondary CCD: status = 0x%x", status);
-		if ((status & 2) == 2) { /* Primary CCD exposure is in progress so no need for the shutter delay */
-			eep.ccd |= END_SKIP_DELAY;
-		}		
+	/* Skip end exposure shutter delay for secondary CCD if its exposure did not move the shutter */
+	if (!PRIMARY_CCD && (PRIVATE_DATA->guider_ccd_exp_params.openShutter == SC_LEAVE_SHUTTER)) {
+		eep.ccd |= END_SKIP_DELAY;
 	}
 
 	res = sbig_command(CC_END_EXPOSURE, &eep, NULL);
@@ -867,6 +898,25 @@ static bool sbig_abort_exposure(indigo_device *device) {
 	EndExposureParams eep;
 	pthread_mutex_lock(&driver_mutex);
 
+	if (PRIMARY_CCD) {
+		PRIVATE_DATA->imager_abort_count++;
+		PRIVATE_DATA->imager_no_check_temperature = false;
+		if (PRIVATE_DATA->imager_waiting) {
+			/* not started yet, ending it could move the shutter during the guider exposure */
+			pthread_mutex_unlock(&driver_mutex);
+			return true;
+		}
+	} else {
+		PRIVATE_DATA->guider_abort_count++;
+		PRIVATE_DATA->guider_no_check_temperature = false;
+		if (!PRIVATE_DATA->guider_exposing) {
+			/* not started or already ended, the imager may be exposing by now */
+			pthread_mutex_unlock(&driver_mutex);
+			return true;
+		}
+		PRIVATE_DATA->guider_exposing = 0;
+	}
+
 	int res = set_sbig_handle(PRIVATE_DATA->driver_handle);
 	if (res != CE_NO_ERROR) {
 		INDIGO_DRIVER_ERROR(DRIVER_NAME, "set_sbig_handle(%d) = %d (%s)", PRIVATE_DATA->driver_handle, res, sbig_error_string(res));
@@ -875,11 +925,12 @@ static bool sbig_abort_exposure(indigo_device *device) {
 	}
 
 	if (PRIMARY_CCD) {
-		PRIVATE_DATA->imager_no_check_temperature = false;
 		eep.ccd = CCD_IMAGING;
 	} else {
-		PRIVATE_DATA->guider_no_check_temperature = false;
 		eep.ccd = EXTERNAL_GUIDE_HEAD ? CCD_EXT_TRACKING : CCD_TRACKING;
+		if (PRIVATE_DATA->guider_ccd_exp_params.openShutter == SC_LEAVE_SHUTTER) {
+			eep.ccd |= END_SKIP_DELAY;
+		}
 	}
 
 	res = sbig_command(CC_END_EXPOSURE, &eep, NULL);
@@ -1159,7 +1210,12 @@ static void handle_exposure_property(indigo_device *device) {
 	   bus. It must therefore not run in ccd_change_property(), where the bus lock is held, but here. */
 	indigo_use_shortest_exposure_if_bias(device);
 	indigo_ccd_exposure_setup(device);
-	long ok = sbig_start_exposure(device, CCD_EXPOSURE_ITEM->number.target, CCD_FRAME_TYPE_DARK_ITEM->sw.value || CCD_FRAME_TYPE_DARKFLAT_ITEM->sw.value || CCD_FRAME_TYPE_BIAS_ITEM->sw.value, CCD_FRAME_LEFT_ITEM->number.value, CCD_FRAME_TOP_ITEM->number.value, CCD_FRAME_WIDTH_ITEM->number.value, CCD_FRAME_HEIGHT_ITEM->number.value, CCD_BIN_HORIZONTAL_ITEM->number.value, CCD_BIN_VERTICAL_ITEM->number.value);
+	sbig_exposure_result result = sbig_start_exposure(device, CCD_EXPOSURE_ITEM->number.target, CCD_FRAME_TYPE_DARK_ITEM->sw.value || CCD_FRAME_TYPE_DARKFLAT_ITEM->sw.value || CCD_FRAME_TYPE_BIAS_ITEM->sw.value, CCD_FRAME_LEFT_ITEM->number.value, CCD_FRAME_TOP_ITEM->number.value, CCD_FRAME_WIDTH_ITEM->number.value, CCD_FRAME_HEIGHT_ITEM->number.value, CCD_BIN_HORIZONTAL_ITEM->number.value, CCD_BIN_VERTICAL_ITEM->number.value);
+	if (result == SBIG_EXPOSURE_CANCELLED) {
+		/* aborted or disconnected while waiting, the abort or disconnect handling does the cleanup */
+		return;
+	}
+	bool ok = result == SBIG_EXPOSURE_STARTED;
 	if (ok && CCD_EXPOSURE_PROPERTY->state != INDIGO_BUSY_STATE) {
 		/* aborted while the exposure was being started */
 		sbig_abort_exposure(device);
@@ -1436,6 +1492,8 @@ static void ccd_connect_callback(indigo_device *device) {
 				indigo_cancel_timer_sync(device, &PRIVATE_DATA->imager_ccd_temperature_timer);
 				if (CCD_EXPOSURE_PROPERTY->state == INDIGO_BUSY_STATE) {
 					indigo_cancel_timer_sync(device, &PRIVATE_DATA->imager_ccd_exposure_timer);
+					/* an exposure left running would block the shutter for the guider CCD */
+					sbig_abort_exposure(device);
 				}
 				indigo_delete_property(device, SBIG_FREEZE_TEC_PROPERTY, NULL);
 				indigo_delete_property(device, SBIG_ABG_PROPERTY, NULL);
@@ -1448,6 +1506,7 @@ static void ccd_connect_callback(indigo_device *device) {
 				indigo_cancel_timer_sync(device, &PRIVATE_DATA->guider_ccd_temperature_timer);
 				if (CCD_EXPOSURE_PROPERTY->state == INDIGO_BUSY_STATE) {
 					indigo_cancel_timer_sync(device, &PRIVATE_DATA->guider_ccd_exposure_timer);
+					sbig_abort_exposure(device);
 				}
 				if (PRIVATE_DATA->guider_buffer != NULL) {
 					free(PRIVATE_DATA->guider_buffer);
