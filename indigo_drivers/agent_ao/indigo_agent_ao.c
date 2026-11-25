@@ -249,6 +249,7 @@ typedef struct {
 	double preview_time;
 	bool frames_wanted;
 	bool streaming;
+	bool stream_warned;
 	bool has_streaming;
 	volatile indigo_property_state exposure_state;
 	volatile indigo_property_state streaming_state;
@@ -544,6 +545,7 @@ static bool start_frames(indigo_device *device) {
 	DEVICE_PRIVATE_DATA->saved_image_format = indigo_save_switch_state(device, CCD_IMAGE_FORMAT_PROPERTY_NAME, CCD_IMAGE_FORMAT_RAW_ITEM_NAME);
 	DEVICE_PRIVATE_DATA->streaming = false;
 	DEVICE_PRIVATE_DATA->dark_warned = false;
+	DEVICE_PRIVATE_DATA->stream_warned = false;
 	if (DEVICE_PRIVATE_DATA->has_streaming) {
 		static const char *names[] = { CCD_STREAMING_EXPOSURE_ITEM_NAME, CCD_STREAMING_COUNT_ITEM_NAME };
 		double values[] = { SET(S_EXPOSURE), -1 };
@@ -580,6 +582,16 @@ static void stop_frames(indigo_device *device) {
 	indigo_restore_switch_state(device, CCD_IMAGE_FORMAT_PROPERTY_NAME, DEVICE_PRIVATE_DATA->saved_image_format);
 }
 
+// A camera driver may give up on a stream when a large frame is not read out soon after a short exposure. It is reported once per process.
+static void warn_stream_stalled(indigo_device *device) {
+	if (DEVICE_PRIVATE_DATA->streaming && !DEVICE_PRIVATE_DATA->stream_warned) {
+		static const char *warning = "No frame received from the camera stream, reduce the frame size (CCD_FRAME) of the camera";
+		DEVICE_PRIVATE_DATA->stream_warned = true;
+		INDIGO_DRIVER_ERROR(DRIVER_NAME, "%s", warning);
+		indigo_send_message(device, BUSY_PROPERTY, "%s", warning);
+	}
+}
+
 // Waits for the next image, copies it to the work buffer and validates it
 static bool get_raw_frame(indigo_device *device, double timeout) {
 	unsigned long serial = DEVICE_PRIVATE_DATA->frame_serial;
@@ -588,7 +600,11 @@ static bool get_raw_frame(indigo_device *device, double timeout) {
 	}
 	double deadline = indigo_monotonic_time() + timeout + (DEVICE_PRIVATE_DATA->streaming ? 0 : SET(S_EXPOSURE));
 	while (DEVICE_PRIVATE_DATA->frame_serial == serial) {
-		if (aborted(device) || indigo_monotonic_time() > deadline) {
+		if (aborted(device)) {
+			return false;
+		}
+		if (indigo_monotonic_time() > deadline) {
+			warn_stream_stalled(device);
 			return false;
 		}
 		indigo_usleep(1000);
@@ -1476,6 +1492,12 @@ static void tracking_process(indigo_device *device) {
 			if (aborted(device)) {
 				break;
 			}
+			// a stream that has ended delivers no more frames, whatever ended it
+			if (DEVICE_PRIVATE_DATA->streaming && DEVICE_PRIVATE_DATA->streaming_state != INDIGO_BUSY_STATE) {
+				indigo_send_message(device, ALERT_PROPERTY, "The camera stream has ended, the AO loop cannot continue");
+				ok = false;
+				break;
+			}
 			DEVICE_PRIVATE_DATA->lost_frames++;
 		} else if (DEVICE_PRIVATE_DATA->skip_frames > 0) {
 			// frames exposed before the AO settled show the star at its old position
@@ -1915,6 +1937,7 @@ static indigo_result agent_delete_property(indigo_client *client, indigo_device 
 	if (device == FILTER_CLIENT_CONTEXT->device) {
 		if (!strcmp(property->name, CCD_STREAMING_PROPERTY_NAME) || *property->name == 0) {
 			CLIENT_PRIVATE_DATA->has_streaming = false;
+			CLIENT_PRIVATE_DATA->streaming_state = INDIGO_ALERT_STATE;
 		}
 	}
 	return indigo_filter_delete_property(client, device, property, message);
